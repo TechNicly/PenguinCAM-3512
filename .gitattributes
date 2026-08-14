@@ -1,0 +1,14 @@
+# Windows batch files must check out with CRLF line endings. cmd.exe mis-parses
+# labels and goto targets in an LF-only .bat, so a file authored on Linux/macOS
+# would fail on Windows depending on the user's core.autocrlf setting.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts must stay LF even on Windows checkouts.
+*.sh text eol=lf
+
+# G-code fixtures and DXF test data: keep bytes exactly as committed so tests
+# that compare generated output are not affected by line-ending translation.
+*.nc -text
+*.tap -text
+*.dxf -text
