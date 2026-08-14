@@ -361,8 +361,18 @@ We use [uv](https://docs.astral.sh/uv/) for fast Python dependency management. T
    ```bash
    make run
    ```
-   This starts the server with `AUTH_ENABLED=false` - visit http://localhost:6238
-   and upload DXF files by hand (export the part face from Onshape as DXF).
+   Visit http://localhost:6238 and upload DXF files by hand (export the part face
+   from Onshape as DXF). This sets `AUTH_ENABLED=false` (Google sign-in) and
+   `ONSHAPE_AUTH_REQUIRED=false`, which opens the app pages that otherwise sit
+   behind the Onshape OAuth gate - without OAuth credentials that gate redirects to
+   an Onshape error. Both default to their secure values, so deployed instances
+   keep their access control.
+
+   On Windows (no `make`), the equivalent is:
+   ```powershell
+   $env:AUTH_ENABLED="false"; $env:ONSHAPE_AUTH_REQUIRED="false"
+   .venv\Scripts\python.exe frc_cam_gui_app.py
+   ```
 
    **Using your team's settings locally:** drop your `PenguinCAM-config.yaml` next
    to the app (it's gitignored) or point at it with `PENGUINCAM_CONFIG=/path/to.yaml`.

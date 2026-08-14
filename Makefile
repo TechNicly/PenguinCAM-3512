@@ -10,7 +10,7 @@ install:
 # Drop a PenguinCAM-config.yaml next to the app (or set PENGUINCAM_CONFIG=path)
 # to use your team's machine settings; edits are picked up without a restart.
 run: install
-	AUTH_ENABLED=false uv run python frc_cam_gui_app.py
+	AUTH_ENABLED=false ONSHAPE_AUTH_REQUIRED=false uv run python frc_cam_gui_app.py
 
 test:
 	@echo "Running unit tests..."

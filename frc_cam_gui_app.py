@@ -334,6 +334,18 @@ TEAM_CONFIG_TTL_SECONDS = 600  # 10 minutes
 
 
 # ---------------------------------------------------------------------------
+# Local mode (running without Onshape sign-in)
+# ---------------------------------------------------------------------------
+# The app pages normally sit behind an Onshape OAuth gate. Set
+# ONSHAPE_AUTH_REQUIRED=false (what `make run` does) to open them for local,
+# DXF-upload use on a machine with no OAuth credentials. Defaults to ON so
+# deployed instances are unaffected.
+ONSHAPE_AUTH_REQUIRED = os.environ.get(
+    'ONSHAPE_AUTH_REQUIRED', 'true').strip().lower() not in ('0', 'false', 'no', 'off')
+if not ONSHAPE_AUTH_REQUIRED:
+    log("🔓 Local mode: Onshape sign-in not required (upload DXF files directly)")
+
+# ---------------------------------------------------------------------------
 # Local team-config fallback (for running without Onshape sign-in)
 # ---------------------------------------------------------------------------
 # When a session has no Onshape-fetched config (typical for `make run` local use),
@@ -501,7 +513,15 @@ def _app_template_context():
 
 def _require_onshape_auth():
     """Apply the Onshape OAuth gate. Returns a redirect response if unauthenticated,
-    else None. Shared by the app pages."""
+    else None. Shared by the app pages.
+
+    Skipped entirely in local mode (ONSHAPE_AUTH_REQUIRED=false, what `make run` sets):
+    without OAuth credentials the redirect lands on an Onshape 400, which makes the
+    DXF-upload workflow unreachable on a machine that never intends to sign in. The
+    gate stays ON by default, so hosted deployments keep their access control.
+    """
+    if not ONSHAPE_AUTH_REQUIRED:
+        return None
     if ONSHAPE_AVAILABLE:
         user_id = get_current_user_id()
         client = session_manager.get_client(user_id)
