@@ -357,22 +357,34 @@ We use [uv](https://docs.astral.sh/uv/) for fast Python dependency management. T
    make test
    ```
 
-4. **Set environment variables** (for running the web app):
+4. **Run locally (no sign-in needed):**
+   ```bash
+   make run
+   ```
+   This starts the server with `AUTH_ENABLED=false` - visit http://localhost:6238
+   and upload DXF files by hand (export the part face from Onshape as DXF).
+
+   **Using your team's settings locally:** drop your `PenguinCAM-config.yaml` next
+   to the app (it's gitignored) or point at it with `PENGUINCAM_CONFIG=/path/to.yaml`.
+   It's the same file you upload to Onshape; a signed-in session's Onshape config
+   still takes precedence. Edits are picked up on the next request - no restart.
+
+   The Onshape one-click panel and Google sign-in/Drive need OAuth credentials and
+   are normally used on a deployed instance:
    ```bash
    export GOOGLE_CLIENT_ID=your-client-id
    export GOOGLE_CLIENT_SECRET=your-secret
    export ONSHAPE_CLIENT_ID=your-onshape-id
    export ONSHAPE_CLIENT_SECRET=your-onshape-secret
    export BASE_URL=http://localhost:6238
-   export AUTH_ENABLED=false  # Skip auth for local testing
-   ```
-
-5. **Run locally:**
-   ```bash
    uv run python frc_cam_gui_app.py
    ```
 
-6. **Visit:** http://localhost:6238
+5. **Compress an existing G-code file** (generated before this optimizer existed):
+   ```bash
+   uv run python gcode_optimize.py BELLYPAN.nc            # writes BELLYPAN-compressed.nc
+   uv run python gcode_optimize.py in.nc out.nc --no-arcs # for arc-less controllers
+   ```
 
 ### Deployment
 

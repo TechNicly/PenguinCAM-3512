@@ -333,6 +333,55 @@ def get_onshape_client_or_401():
 TEAM_CONFIG_TTL_SECONDS = 600  # 10 minutes
 
 
+# ---------------------------------------------------------------------------
+# Local team-config fallback (for running without Onshape sign-in)
+# ---------------------------------------------------------------------------
+# When a session has no Onshape-fetched config (typical for `make run` local use),
+# fall back to a YAML file on disk: $PENGUINCAM_CONFIG if set, else a
+# PenguinCAM-config.yaml sitting next to the app. Hosted deployments are unaffected -
+# they have no such file, and a signed-in session's Onshape config always wins.
+
+_LOCAL_CONFIG_DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'PenguinCAM-config.yaml')
+_local_config_cache = {'path': None, 'mtime': None, 'data': {}}
+
+
+def _local_team_config_data():
+    """Parsed team config from the local YAML file, or {} when there is none.
+
+    Re-parses only when the file's path or mtime changes, so edits apply on the next
+    request without a server restart (handy while tuning feeds locally). A malformed
+    file logs a warning and counts as absent rather than failing every request.
+    """
+    path = os.environ.get('PENGUINCAM_CONFIG') or _LOCAL_CONFIG_DEFAULT_PATH
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    cache = _local_config_cache
+    if cache['path'] == path and cache['mtime'] == mtime:
+        return cache['data']
+    try:
+        with open(path, 'r') as f:
+            team_config = TeamConfig.from_yaml(f.read())
+        cache.update(path=path, mtime=mtime, data=team_config._data)
+        log(f"📁 Local team config loaded from {path}: "
+            f"{team_config.team_name} (#{team_config.team_number})")
+    except Exception as e:
+        log(f"⚠️  Could not parse local config {path}: {e} - using defaults")
+        cache.update(path=path, mtime=mtime, data={})
+    return cache['data']
+
+
+def _team_config_data():
+    """The active team config: the Onshape-fetched session copy when signed in, else
+    the local-file fallback. All request handlers read config through this."""
+    data = session.get('team_config_data')
+    if data:
+        return data
+    return _local_team_config_data()
+
+
 def _load_team_config_into_session(client):
     """Fetch PenguinCAM-config.yaml from the user's Onshape classroom and store it in the
     session. Single source of truth for how config lands in the session - used by the OAuth
@@ -388,7 +437,7 @@ def _app_template_context():
     user_name = session.get('user_name')
     team_name = session.get('team_name')
 
-    team_config_data = session.get('team_config_data', {})
+    team_config_data = _team_config_data()
     team_config = TeamConfig(team_config_data)
 
     machines = team_config.get_available_machines()
@@ -466,7 +515,7 @@ def _compute_dxf_outline(path):
     """Load a DXF and return its perimeter outline + dims + holes for the wizard layout
     canvas/thumbnail. Coordinates normalized so the bounding-box minimum is (0,0).
     Returns a dict (width, height, outline, holes) or None if there is no geometry."""
-    team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+    team_config = TeamConfig.from_dict(_team_config_data())
     pp = FRCPostProcessor(material_thickness=0.25, tool_diameter=0.125,
                           units='inch', config=team_config)
     pp.load_dxf(path)
@@ -741,7 +790,7 @@ def process_file():
         log(f"🚀 Running post-processor API...")
 
         # Get team config from session (if available)
-        config_data = session.get('team_config_data', {})
+        config_data = _team_config_data()
         log(f"🔍 DEBUG: Session team_config_data keys: {list(config_data.keys()) if config_data else 'EMPTY'}")
         log(f"🔍 DEBUG: Session has {len(config_data)} top-level keys in team_config_data")
         team_config = TeamConfig.from_dict(config_data)
@@ -984,7 +1033,7 @@ def process_job():
             f.save(p)
             saved_paths[idx] = p
 
-        team_config = TeamConfig.from_dict(session.get('team_config_data', {}))
+        team_config = TeamConfig.from_dict(_team_config_data())
         user_name = session.get('user_name')
         machine_x = team_config.machine_x_max
         machine_y = team_config.machine_y_max
@@ -1853,7 +1902,7 @@ def set_machine():
             return jsonify({'error': 'No machine_id provided'}), 400
 
         # Verify machine exists in config
-        team_config_data = session.get('team_config_data', {})
+        team_config_data = _team_config_data()
         team_config = TeamConfig(team_config_data)
         machines = team_config.get_available_machines()
 

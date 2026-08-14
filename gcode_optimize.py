@@ -532,3 +532,54 @@ def path_stats(lines: List[str]) -> dict:
         else:
             counts['arc'] += 1
     return counts
+
+
+def main(argv=None):
+    """CLI: compress an already-generated G-code file in place of regenerating it.
+
+        uv run python gcode_optimize.py INPUT.nc [OUTPUT.nc] [--tolerance T] [--no-arcs]
+
+    Useful for programs produced before this optimizer existed (or by a server that
+    doesn't have it yet). The compressed path stays within --tolerance of the input
+    path; see the module docstring for the full safety rules.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Compress a G-code program: drop duplicate moves, merge collinear "
+                    "G1 runs, and refit chorded circles into G2/G3 arcs, holding the "
+                    "path within --tolerance of the original.")
+    parser.add_argument('input', help="G-code file to read (.nc, .tap, ...)")
+    parser.add_argument('output', nargs='?', default=None,
+                        help="output file (default: INPUT name with a -compressed suffix)")
+    parser.add_argument('--tolerance', type=float, default=DEFAULT_TOLERANCE,
+                        help="max path deviation, in the file's units "
+                             f"(default {DEFAULT_TOLERANCE})")
+    parser.add_argument('--no-arcs', action='store_true',
+                        help="never emit G2/G3 (for controllers without arc support)")
+    args = parser.parse_args(argv)
+
+    with open(args.input, 'r') as f:
+        lines = f.read().splitlines()
+
+    out = optimize_gcode(lines, tolerance=args.tolerance,
+                         arc_fitting=not args.no_arcs)
+
+    output = args.output
+    if output is None:
+        import os
+        base, ext = os.path.splitext(args.input)
+        output = f"{base}-compressed{ext or '.nc'}"
+    with open(output, 'w') as f:
+        f.write('\n'.join(out) + '\n')
+
+    before, after = path_stats(lines), path_stats(out)
+    print(f"{args.input}: {before['total']} lines "
+          f"({before['linear']} G1, {before['arc']} arc)")
+    print(f"{output}: {after['total']} lines "
+          f"({after['linear']} G1, {after['arc']} arc) - "
+          f"{100 * after['total'] / max(1, before['total']):.0f}% of original")
+
+
+if __name__ == '__main__':
+    main()
