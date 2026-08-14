@@ -18,17 +18,33 @@ from shapely.geometry import LineString
 from shapely.ops import linemerge
 
 
-def sample_arc(arc, num_points=20):
-    """Sample an ARC entity into a list of (x, y) points."""
+def sample_arc(arc, num_points=None, chord_tolerance=0.0002):
+    """Sample an ARC entity into a list of (x, y) points.
+
+    By default the chord count adapts to the arc so the polyline stays within
+    `chord_tolerance` (sagitta, inches) of the true arc: a big sweeping perimeter arc
+    gets enough points to hold tolerance (a fixed 20 chords on a 10" radius quarter
+    circle deviates ~0.008" mid-chord), while a small drill-size fillet no longer gets
+    20 needless vertices. Pass `num_points` to force a fixed count.
+    """
     center = (arc.dxf.center.x, arc.dxf.center.y)
     radius = arc.dxf.radius
     start_angle = math.radians(arc.dxf.start_angle)
     end_angle = math.radians(arc.dxf.end_angle)
     if end_angle <= start_angle:
         end_angle += 2 * math.pi
+    sweep = end_angle - start_angle
+    if num_points is None:
+        if radius > chord_tolerance:
+            # Max angle per chord for sagitta r*(1-cos(step/2)) <= chord_tolerance.
+            max_step = 2 * math.acos(1 - chord_tolerance / radius)
+            num_points = int(math.ceil(sweep / max_step))
+        else:
+            num_points = 1
+        num_points = max(8, min(num_points, 512))
     return [
-        (center[0] + radius * math.cos(start_angle + (end_angle - start_angle) * k / num_points),
-         center[1] + radius * math.sin(start_angle + (end_angle - start_angle) * k / num_points))
+        (center[0] + radius * math.cos(start_angle + sweep * k / num_points),
+         center[1] + radius * math.sin(start_angle + sweep * k / num_points))
         for k in range(num_points + 1)
     ]
 

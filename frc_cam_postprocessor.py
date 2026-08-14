@@ -26,6 +26,7 @@ from shapely.ops import unary_union
 
 # Local modules
 from dxf_geometry import entities_to_closed_paths, sample_spline
+from gcode_optimize import optimize_gcode
 from team_config import TeamConfig
 
 
@@ -126,6 +127,12 @@ class FRCPostProcessor:
 
         # Hole detection tolerance from config
         self.tolerance = config.hole_detection_tolerance
+
+        # Output toolpath compression (collinear merge + arc refit) from config.
+        # Applied as the last step of G-code generation; see gcode_optimize.py.
+        self.gcode_compression_enabled = config.gcode_compression_enabled
+        self.gcode_compression_tolerance = config.gcode_compression_tolerance
+        self.gcode_arc_fitting = config.gcode_arc_fitting
 
         # Minimum hole diameter that can be milled (must be > tool diameter for chip evacuation)
         # Holes smaller than this are skipped
@@ -1412,6 +1419,25 @@ class FRCPostProcessor:
 
         return gcode
 
+    def _optimize_output(self, gcode_lines: List[str]) -> List[str]:
+        """Compress the fully-assembled program (collinear merge + arc refit).
+
+        Toolpaths are generated from Shapely polygons, one G1 per vertex, so the raw
+        program is enormous - a sampled DXF arc costs ~21 blocks for one fillet. This
+        final pass rewrites those runs as the few lines/arcs they geometrically are,
+        holding every point within gcode_compression_tolerance of the raw path.
+        Called on the complete line list right before joining, so it covers every
+        feature generator uniformly. See gcode_optimize.py for the safety rules.
+        """
+        if not self.gcode_compression_enabled:
+            return gcode_lines
+        tolerance = self.gcode_compression_tolerance
+        if self.units == "mm":
+            tolerance *= 25.4  # config value is inches; match mm-coordinate output
+        return optimize_gcode(gcode_lines,
+                              tolerance=tolerance,
+                              arc_fitting=self.gcode_arc_fitting)
+
     def generate_gcode(self, suggested_filename: str = None, timestamp: str = None,
                        include_header_footer: bool = True) -> PostProcessorResult:
         """
@@ -1480,6 +1506,9 @@ class FRCPostProcessor:
         # Footer (skipped for job-body mode; assemble_job_gcode adds one shared footer)
         if include_header_footer:
             gcode.extend(self._generate_gcode_footer())
+
+        # Compress the assembled toolpath before estimating time and joining.
+        gcode = self._optimize_output(gcode)
 
         # Calculate estimated cycle time
         time_estimate = self._estimate_cycle_time(gcode)
@@ -2577,6 +2606,9 @@ class FRCPostProcessor:
 
         # Footer
         gcode.extend(self._generate_gcode_footer())
+
+        # Compress the assembled toolpath before estimating time and joining.
+        gcode = self._optimize_output(gcode)
 
         # Calculate estimated cycle time
         time_estimate = self._estimate_cycle_time(gcode)
@@ -5488,6 +5520,9 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     _emit_phase("PHASE: TAB REMOVAL", 'tab_removal')
 
     gcode.extend(header_pp._generate_gcode_footer())
+
+    # Compress the assembled program before estimating time and joining.
+    gcode = header_pp._optimize_output(gcode)
 
     # Estimate total cycle time across the whole program and insert into the header.
     time_estimate = header_pp._estimate_cycle_time(gcode)

@@ -60,3 +60,36 @@ general G-code sender rather than importing it into Easel.
   default.
 * If you enable `park_position`, then (and only then) the program assumes machine Z=0 is a
   safe high position, since the park raises to `G53 Z<park_z>`.
+
+---
+
+## 4. Output Toolpath Compression (arcs in the output)
+
+Toolpaths are computed as dense polylines (one vertex per sampled arc chord / polygon
+offset vertex). As the **final step** of generation, `gcode_optimize.py` compresses runs
+of short `G1` moves: exact duplicates are dropped, collinear runs merge into one `G1`,
+and chord sequences that describe a circle are re-fit into a single `G2`/`G3`
+(incremental `I J` centers, matching the `G91.1` header). This typically shrinks a
+program ~2–3x, which matters for controllers like **Mach3** that stall (and fail to
+render the toolpath preview) on very large files of very short blocks.
+
+Assumptions and guarantees:
+
+* The compressed path stays within `machining.output.tolerance` (default **0.0005"**) of
+  the raw toolpath; run endpoints (plunges, tab starts/ends, ramp ends) are preserved
+  exactly.
+* Every emitted arc's start/end radii agree within 0.0002" at the printed 4-decimal
+  precision, so controllers that validate arc radius consistency (Mach3) accept them.
+* Arcs are emitted only for spans between ~5° and ~350° of sweep — never full circles.
+* The controller must support `G2`/`G3` with `G91.1` incremental centers (already
+  required by helical entries, see section 1). If a controller can't take arcs at all,
+  set `machining.output.arc_fitting: false`; to ship the raw uncompressed toolpath, set
+  `machining.output.compression: false`.
+
+```yaml
+machining:
+  output:
+    compression: true     # default
+    tolerance: 0.0005     # inches of allowed path deviation
+    arc_fitting: true     # emit G2/G3 during compression
+```

@@ -47,6 +47,8 @@ LENGTH_KEYS = frozenset({
     'roughing_tool_edge', 'finishing_tool_edge', 'arc_advance', 'arc_radius',
     'ramp_start_clearance', 'max_slotting_depth', 'peck_drill_depth',  # materials
     'tab_width', 'tab_height',
+    'detection_tolerance',                                       # machining.holes
+    'tolerance',                                                 # machining.output
 })
 
 
@@ -139,6 +141,18 @@ TEAM_6238_DEFAULTS = {
         'holes': {
             'detection_tolerance': 0.02,
             'min_millable_multiplier': 1.2
+        },
+        'output': {
+            # Toolpath compression of the emitted G-code: merge collinear G1 runs and
+            # refit chord sequences back into G2/G3 arcs, holding the path within
+            # `tolerance` inches of the uncompressed toolpath. Cuts program size ~2-3x
+            # (Shapely-generated toolpaths emit one G1 per polygon vertex), which keeps
+            # controllers like Mach3 from choking on huge files and starving look-ahead.
+            # Set `compression: false` (or tolerance 0) to emit the raw toolpath;
+            # set `arc_fitting: false` for a controller that cannot execute G2/G3.
+            'compression': True,
+            'tolerance': 0.0005,
+            'arc_fitting': True
         },
         'pockets': {
             # Contour threshold: feature area in multiples of tool cross-section (at 100% stepover)
@@ -554,6 +568,25 @@ class TeamConfig:
     def min_millable_hole_multiplier(self) -> float:
         """Minimum hole diameter as multiple of tool diameter"""
         return self._get('machining', 'holes', 'min_millable_multiplier')
+
+    @property
+    def gcode_compression_enabled(self) -> bool:
+        """Whether emitted G-code is compressed (collinear merge + arc refit)"""
+        return bool(self._get('machining', 'output', 'compression'))
+
+    @property
+    def gcode_compression_tolerance(self) -> float:
+        """Max path deviation allowed by G-code compression (inches). 0 disables."""
+        value = self._get('machining', 'output', 'tolerance')
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0005
+
+    @property
+    def gcode_arc_fitting(self) -> bool:
+        """Whether compression may emit G2/G3 arcs (disable for arc-less controllers)"""
+        return bool(self._get('machining', 'output', 'arc_fitting'))
 
     def _raw_default_tool_diameter(self, machine_id: Optional[str] = None):
         """Raw default-tool diameter (may be a unit string). Checked at the machine top
