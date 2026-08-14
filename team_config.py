@@ -136,7 +136,12 @@ TEAM_6238_DEFAULTS = {
             'remove_tabs': True
         },
         'fixturing': {
-            'pause_before_perimeter': False
+            'pause_before_perimeter': False,
+            # Pause once after all circular holes are drilled, BEFORE contoured
+            # holes/pockets and pocket clearing begin - so screws can go in through
+            # the fresh holes before any through-cut starts releasing material.
+            # When enabled, it replaces the per-contour fixturing pauses.
+            'pause_after_holes': False
         },
         'holes': {
             'detection_tolerance': 0.02,
@@ -558,6 +563,12 @@ class TeamConfig:
     def pause_before_perimeter(self) -> bool:
         """Whether to pause before cutting perimeter (for screw fixturing)"""
         return self._get('machining', 'fixturing', 'pause_before_perimeter')
+
+    @property
+    def pause_after_holes(self) -> bool:
+        """Whether to pause after circular holes, before contour/pocket cutting
+        (screws go in through the fresh holes before through-cuts begin)"""
+        return bool(self._get('machining', 'fixturing', 'pause_after_holes'))
 
     @property
     def hole_detection_tolerance(self) -> float:

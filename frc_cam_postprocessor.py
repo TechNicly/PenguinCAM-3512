@@ -175,6 +175,7 @@ class FRCPostProcessor:
 
         # Fixturing preferences from config
         self.pause_before_perimeter = config.pause_before_perimeter  # Pause before perimeter for screw fixturing
+        self.pause_after_holes = config.pause_after_holes  # Pause after circular holes, before contours/pockets
 
         # Tube facing parameters
         self.tube_facing_offset = 0.0625  # Hole offset to align with faced surface at Y=+1/16" (inches)
@@ -1268,13 +1269,50 @@ class FRCPostProcessor:
         or contouring for large through-holes) followed by all pockets (fully cleared or
         contoured). Returns only the toolpath lines - no header/footer/perimeter.
 
+        When pause_after_holes is configured, a single "PAUSE FOR FIXTURING" is emitted
+        at the holes/contours boundary (screws go in through the fresh holes before any
+        through-cut starts releasing material) and the per-contour pauses are replaced
+        by it.
+
         Args:
             emit_contour_pauses: when True, emit the standalone "PAUSE FOR FIXTURING"
                 sequence before contoured holes/pockets (single-part behavior, gated by
                 pause_before_perimeter). The multi-part job assembler passes False because
-                it emits a single shared pause between all interiors and all perimeters.
+                it emits shared pauses between the collated phases instead.
         """
-        gcode = []
+        holes_gcode, middle, rest_gcode = self._generate_interior_sections(emit_contour_pauses)
+        return holes_gcode + middle + rest_gcode
+
+    def _generate_interior_sections(self, emit_contour_pauses: bool,
+                                    job_mode: bool = False):
+        """Build the interior toolpath split at the fixturing boundary.
+
+        The boundary sits after all CLEARED circular holes (the ones screws can go
+        through) and before everything that follows: contoured large holes, pocket
+        clearing, and pocket contours - i.e. before any cut that wants the part
+        screwed down.
+
+        Returns (holes_gcode, middle_gcode, rest_gcode):
+          holes_gcode: the HOLES section header, classification comments, and the
+              cleared-hole toolpath.
+          middle_gcode: the pause-after-holes sequence, when configured and applicable
+              (single-part mode only - empty in job_mode, where assemble_job_gcode
+              emits one shared pause between the collated HOLES and INTERIOR phases).
+          rest_gcode: contoured holes + all pockets.
+
+        job_mode: set by generate_part_phases. When splitting for a job
+            (pause_after_holes configured), rest_gcode becomes the start of its own
+            program phase - the tool re-enters from safe Z, so the first approach must
+            rapid down to the clearance plane (_pending_clearance_rapid).
+        """
+        # When the after-holes pause is on, it REPLACES the per-contour pauses: the
+        # part is already screwed down by the time any contour runs.
+        emit_contour_pauses = emit_contour_pauses and not self.pause_after_holes
+
+        gcode = []           # current append target; starts as the holes section
+        holes_gcode = gcode
+        cleared_holes = []
+        contoured_holes = []
 
         # Holes (all circular features - helical entry + spiral clearing, or contouring for large holes)
         if self.holes:
@@ -1288,9 +1326,6 @@ class FRCPostProcessor:
             is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
 
             # Separate holes into contoured and cleared based on size
-            contoured_holes = []
-            cleared_holes = []
-
             for i, hole in enumerate(self.holes, 1):
                 center = hole['center']
                 diameter = hole['diameter']
@@ -1322,6 +1357,28 @@ class FRCPostProcessor:
                     gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
                     gcode.append("")
 
+        # ----- Fixturing boundary: cleared holes done, through-cuts about to start -----
+        middle = []
+        boundary_has_work_after = bool(contoured_holes or self.pockets)
+        if self.pause_after_holes and cleared_holes and boundary_has_work_after:
+            if job_mode:
+                # assemble_job_gcode emits the shared pause between the collated HOLES
+                # and INTERIOR phases; the rest section re-enters from safe Z there, so
+                # its first approach must rapid down to the clearance plane first.
+                self._pending_clearance_rapid = True
+            else:
+                middle = self._generate_pause_and_park_gcode(
+                    'PAUSE FOR FIXTURING',
+                    [
+                        'All circular holes complete',
+                        'Install screws through holes into sacrifice board',
+                        'Fixture part securely before contour cutting begins'
+                    ]
+                )
+        rest_gcode = []
+        gcode = rest_gcode   # everything from here on is after the boundary
+
+        if self.holes:
             # Process contoured holes (with optional pause for fixturing)
             if contoured_holes:
                 # Optional pause before contoured holes for teams using screw fixturing
@@ -1417,7 +1474,7 @@ class FRCPostProcessor:
                     gcode.extend(self._generate_pocket_contour_gcode(pocket))
                     gcode.append("")
 
-        return gcode
+        return holes_gcode, middle, rest_gcode
 
     def _optimize_output(self, gcode_lines: List[str]) -> List[str]:
         """Compress the fully-assembled program (collinear merge + arc refit).
@@ -1566,17 +1623,22 @@ class FRCPostProcessor:
         single-layer part (multi-part jobs are 2D standard mode; 2.5D is single-part).
 
         Returns a dict:
-            {'interior': [str], 'perimeter': [str], 'tab_removal': [str], 'errors': [str]}
+            {'holes': [str], 'interior': [str], 'perimeter': [str],
+             'tab_removal': [str], 'errors': [str]}
+        'holes' is non-empty only when pause_after_holes is configured - it carries the
+        cleared-hole toolpath as its own phase so the assembler can pause for screw
+        fixturing between all parts' holes and all parts' contours/pockets; otherwise
+        the holes stay at the front of 'interior' exactly as before.
         Coordinates are already in absolute job space (transform_coordinates applied the
         placement offset), so phases from different parts can be freely interleaved.
         """
         # Fail fast on pre-existing validation errors (same guard as generate_gcode).
         if self.errors:
-            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+            return {'holes': [], 'interior': [], 'perimeter': [], 'tab_removal': [],
                     'errors': self.errors.copy()}
 
         if self.layer_data:
-            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+            return {'holes': [], 'interior': [], 'perimeter': [], 'tab_removal': [],
                     'errors': ['Multi-part jobs support single-layer (2D) parts only; '
                                'this part has multiple depth layers (2.5D).']}
 
@@ -1586,9 +1648,17 @@ class FRCPostProcessor:
         # _emit_phase), so the tool starts each phase up at safe height: flag the first
         # feature of each to rapid down to the clearance plane before its plunge feed.
 
-        # Phase A: interiors (holes + pockets), no per-feature pauses.
+        # Phase A: interiors (holes + pockets), no per-feature pauses. When
+        # pause_after_holes is configured, the cleared-hole toolpath is returned as its
+        # own phase so the assembler can collate all parts' holes, pause once for screw
+        # fixturing, then run all parts' contours/pockets.
         self._pending_clearance_rapid = True
-        interior = self._generate_interior_gcode(emit_contour_pauses=False)
+        holes_section, _middle, rest_section = self._generate_interior_sections(
+            emit_contour_pauses=False, job_mode=True)
+        if self.pause_after_holes:
+            holes_phase, interior = holes_section, rest_section
+        else:
+            holes_phase, interior = [], holes_section + rest_section
 
         # Phase C: perimeter cut, deferring tab removal to phase D.
         perimeter = []
@@ -1605,7 +1675,7 @@ class FRCPostProcessor:
         if self.config.remove_tabs and self._deferred_tab_positions:
             tab_removal = self._generate_tab_removal_gcode(self._deferred_tab_positions)
 
-        return {'interior': interior, 'perimeter': perimeter,
+        return {'holes': holes_phase, 'interior': interior, 'perimeter': perimeter,
                 'tab_removal': tab_removal, 'errors': list(self.errors)}
 
     # ---- Portability helpers: work-coordinate safe moves + optional coolant/park -------
@@ -5457,8 +5527,9 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     Args:
         part_jobs: ordered list of dicts:
             {'name': str, 'place_x': float, 'place_y': float, 'rotation': float,
-             'interior': [str], 'perimeter': [str], 'tab_removal': [str]}
-            -- the three phase line-lists from FRCPostProcessor.generate_part_phases().
+             'holes': [str], 'interior': [str], 'perimeter': [str], 'tab_removal': [str]}
+            -- the phase line-lists from FRCPostProcessor.generate_part_phases().
+            'holes' may be absent/empty (it is populated only under pause_after_holes).
         header_pp: an FRCPostProcessor carrying the shared job parameters (material,
             tool, thickness, spindle, park Z, pause_before_perimeter). Used to build the
             single header/footer, the shared pause, and estimate total cycle time.
@@ -5497,7 +5568,24 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
             gcode.extend(pj[phase_key])
         return True
 
-    # Phase A: all parts' interior features.
+    # Phase A0/A1: when pause_after_holes is configured, all parts' cleared holes run
+    # first, then one shared fixturing pause (screws through the fresh holes), then all
+    # parts' contours/pockets. With the option off, 'holes' is empty on every part and
+    # the whole interior runs as one phase, exactly as before.
+    emitted_holes = _emit_phase("PHASE: HOLES", 'holes')
+    has_more_interior = any(pj.get('interior') for pj in part_jobs)
+    if header_pp.pause_after_holes and emitted_holes and has_more_interior:
+        gcode.extend(header_pp._generate_pause_and_park_gcode(
+            'PAUSE FOR FIXTURING',
+            [
+                "All parts' circular holes complete",
+                'Install screws through holes into sacrifice board on ALL parts',
+                'Fixture every part securely before contour cutting begins'
+            ]
+        ))
+
+    # Phase A: all parts' interior features (contours + pockets when the holes phase
+    # was split out, the whole interior otherwise).
     _emit_phase("PHASE: INTERIOR FEATURES", 'interior')
 
     # Phase B: one shared refixturing pause between interiors and perimeters, if

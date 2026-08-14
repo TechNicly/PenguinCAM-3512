@@ -1123,6 +1123,7 @@ def process_job():
             part_jobs.append({
                 'name': item['name'], 'place_x': item['place_x'],
                 'place_y': item['place_y'], 'rotation': item['rotation'],
+                'holes': phases.get('holes', []),
                 'interior': phases['interior'], 'perimeter': phases['perimeter'],
                 'tab_removal': phases['tab_removal'],
             })
