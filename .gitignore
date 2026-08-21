@@ -4,3 +4,6 @@ venv/
 .env
 .obsidian
 .vercel
+
+# Local team config for `make run` (never commit team-specific machine settings)
+PenguinCAM-config.yaml

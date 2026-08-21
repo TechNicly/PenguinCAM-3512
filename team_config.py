@@ -47,6 +47,8 @@ LENGTH_KEYS = frozenset({
     'roughing_tool_edge', 'finishing_tool_edge', 'arc_advance', 'arc_radius',
     'ramp_start_clearance', 'max_slotting_depth', 'peck_drill_depth',  # materials
     'tab_width', 'tab_height',
+    'detection_tolerance',                                       # machining.holes
+    'tolerance',                                                 # machining.output
 })
 
 
@@ -134,11 +136,33 @@ TEAM_6238_DEFAULTS = {
             'remove_tabs': True
         },
         'fixturing': {
-            'pause_before_perimeter': False
+            'pause_before_perimeter': False,
+            # Pause once after all circular holes are drilled, BEFORE contoured
+            # holes/pockets and pocket clearing begin - so screws can go in through
+            # the fresh holes before any through-cut starts releasing material.
+            # When enabled, it replaces the per-contour fixturing pauses.
+            'pause_after_holes': False,
+            # Whether mid-job fixturing pauses drive to the G53 park_position (when
+            # one is configured). Set false to have pauses raise to safe Z and stop
+            # in place instead - no machine-coordinate motion during the job. The
+            # end-of-program park is unaffected.
+            'park_during_pause': True
         },
         'holes': {
             'detection_tolerance': 0.02,
             'min_millable_multiplier': 1.2
+        },
+        'output': {
+            # Toolpath compression of the emitted G-code: merge collinear G1 runs and
+            # refit chord sequences back into G2/G3 arcs, holding the path within
+            # `tolerance` inches of the uncompressed toolpath. Cuts program size ~2-3x
+            # (Shapely-generated toolpaths emit one G1 per polygon vertex), which keeps
+            # controllers like Mach3 from choking on huge files and starving look-ahead.
+            # Set `compression: false` (or tolerance 0) to emit the raw toolpath;
+            # set `arc_fitting: false` for a controller that cannot execute G2/G3.
+            'compression': True,
+            'tolerance': 0.0005,
+            'arc_fitting': True
         },
         'pockets': {
             # Contour threshold: feature area in multiples of tool cross-section (at 100% stepover)
@@ -459,6 +483,36 @@ class TeamConfig:
         return (x, y, z)
 
     @property
+    def soft_limits(self):
+        """Optional machine-coordinate travel limits: {'x': (min, max), ...}, or None.
+
+        These are HOMED machine coordinates in the controller's own convention - on
+        most Mach3/GRBL machines home is 0 and travel is NEGATIVE, e.g.
+        x: [-22.2, 0]. When set, every G53 move the post-processor emits (the park)
+        is validated against them and generation FAILS on a violation instead of
+        emitting a move that would drive through the physical stops. Axes may be
+        given individually; a missing axis is not validated."""
+        raw = self._get('machine', 'soft_limits')
+        if not isinstance(raw, dict):
+            return None
+        limits = {}
+        for axis in ('x', 'y', 'z'):
+            pair = raw.get(axis)
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            lo = parse_length(pair[0])
+            hi = parse_length(pair[1])
+            if lo is None or hi is None:
+                continue
+            limits[axis] = (min(lo, hi), max(lo, hi))
+        return limits or None
+
+    @property
+    def park_during_pause(self) -> bool:
+        """Whether mid-job fixturing pauses drive to the G53 park position."""
+        return bool(self._get('machining', 'fixturing', 'park_during_pause'))
+
+    @property
     def safe_clearance_height(self):
         """Configured "clear everything" height over Z=0 (sacrifice board) for the G54
         bed-crossing moves (first-cut approach, end retract, multi-part rapids, tube-flip
@@ -546,6 +600,12 @@ class TeamConfig:
         return self._get('machining', 'fixturing', 'pause_before_perimeter')
 
     @property
+    def pause_after_holes(self) -> bool:
+        """Whether to pause after circular holes, before contour/pocket cutting
+        (screws go in through the fresh holes before through-cuts begin)"""
+        return bool(self._get('machining', 'fixturing', 'pause_after_holes'))
+
+    @property
     def hole_detection_tolerance(self) -> float:
         """Tolerance for detecting circular holes (inches)"""
         return self._get('machining', 'holes', 'detection_tolerance')
@@ -554,6 +614,25 @@ class TeamConfig:
     def min_millable_hole_multiplier(self) -> float:
         """Minimum hole diameter as multiple of tool diameter"""
         return self._get('machining', 'holes', 'min_millable_multiplier')
+
+    @property
+    def gcode_compression_enabled(self) -> bool:
+        """Whether emitted G-code is compressed (collinear merge + arc refit)"""
+        return bool(self._get('machining', 'output', 'compression'))
+
+    @property
+    def gcode_compression_tolerance(self) -> float:
+        """Max path deviation allowed by G-code compression (inches). 0 disables."""
+        value = self._get('machining', 'output', 'tolerance')
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0005
+
+    @property
+    def gcode_arc_fitting(self) -> bool:
+        """Whether compression may emit G2/G3 arcs (disable for arc-less controllers)"""
+        return bool(self._get('machining', 'output', 'arc_fitting'))
 
     def _raw_default_tool_diameter(self, machine_id: Optional[str] = None):
         """Raw default-tool diameter (may be a unit string). Checked at the machine top

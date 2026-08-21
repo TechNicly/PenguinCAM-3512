@@ -9,6 +9,7 @@ Generates G-code from DXF files with predefined operations for:
 
 # Standard library
 import argparse
+import contextlib
 import datetime
 import json
 import math
@@ -20,12 +21,13 @@ from typing import List, Tuple, Optional, Dict, Any
 # Third-party
 import ezdxf
 from shapely import affinity
-from shapely.geometry import Point, Polygon, LinearRing, MultiPolygon
+from shapely.geometry import Point, Polygon, LinearRing, LineString, MultiPolygon
 from shapely.geometry.polygon import orient
 from shapely.ops import unary_union
 
 # Local modules
 from dxf_geometry import entities_to_closed_paths, sample_spline
+from gcode_optimize import optimize_gcode
 from team_config import TeamConfig
 
 
@@ -127,6 +129,12 @@ class FRCPostProcessor:
         # Hole detection tolerance from config
         self.tolerance = config.hole_detection_tolerance
 
+        # Output toolpath compression (collinear merge + arc refit) from config.
+        # Applied as the last step of G-code generation; see gcode_optimize.py.
+        self.gcode_compression_enabled = config.gcode_compression_enabled
+        self.gcode_compression_tolerance = config.gcode_compression_tolerance
+        self.gcode_arc_fitting = config.gcode_arc_fitting
+
         # Minimum hole diameter that can be milled (must be > tool diameter for chip evacuation)
         # Holes smaller than this are skipped
         self.min_millable_hole = tool_diameter * config.min_millable_hole_multiplier
@@ -168,6 +176,27 @@ class FRCPostProcessor:
 
         # Fixturing preferences from config
         self.pause_before_perimeter = config.pause_before_perimeter  # Pause before perimeter for screw fixturing
+        self.pause_after_holes = config.pause_after_holes  # Pause after circular holes, before contours/pockets
+
+        # Per-part perimeter tab overrides (from the wizard's Tabs & Fixtures step;
+        # see set_tab_overrides). Defaults reproduce config-driven auto placement.
+        self.tab_override_enabled = None   # None = follow config; True/False forces it
+        self.tab_exclusions = []           # [((ax,ay),(bx,by)), ...] job-space point pairs
+        self.tab_positions = None          # None = auto; [(x,y), ...] = custom tab centers
+        self.tab_warnings = []             # human-readable tab placement warnings
+
+        # Optional second bit for circular holes (wizard "Holes bit"). When set and
+        # different from the main tool, hole classification and the cleared-hole
+        # toolpaths use it, and a mandatory bit-change pause (with Z re-zero
+        # instructions) separates the holes phase from everything cut with the main
+        # bit. None = one bit for the whole job (historical behavior).
+        self.holes_tool_diameter = None
+
+        # Per-pocket partial-depth overrides from the wizard: [((x, y), depth), ...]
+        # where (x, y) is a job-space point inside the pocket and depth is inches
+        # from the material top. Overridden pockets are fully cleared to that Z
+        # (flat bottom) instead of cut through.
+        self.pocket_depth_overrides = []
 
         # Tube facing parameters
         self.tube_facing_offset = 0.0625  # Hole offset to align with faced surface at Y=+1/16" (inches)
@@ -180,6 +209,11 @@ class FRCPostProcessor:
         # portable across controllers.
         self.park_position = config.park_position  # (x, y, z) machine coords, or None
         self.safe_clearance_height = config.safe_clearance_height  # configured G54 ceiling, or None
+        # Machine-coordinate travel limits for validating G53 moves ({'x': (min, max),
+        # ...} or None) and whether mid-job pauses may drive to the park position.
+        self.soft_limits = config.soft_limits
+        self.park_during_pause = config.park_during_pause
+        self.park_warnings = []  # non-blocking park safety notices for the response
         # Work coordinate system for tube ops. 'G54' (default) = operator zeros G54 to the
         # tube per job (portable); an alternate fixed WCS (e.g. 'G55') is opt-in for a
         # permanently-fixtured jig so its zero persists alongside the flat-work G54 zero.
@@ -330,7 +364,11 @@ class FRCPostProcessor:
         # pass safe_z; otherwise the material-based work clearance is used.
         z = safe_z if safe_z is not None else self._safe_z()
         gcode.append(f'G0 Z{z:.4f}  ; Safe Z clearance')
-        gcode.extend(self._park_gcode('Park'))  # G53 park only if configured
+        # Mid-job parking is opt-out (machining.fixturing.park_during_pause): with it
+        # off, the pause raises to safe Z and stops in place - no G53 motion during
+        # the job. (And as always, no park_position -> no G53 at all.)
+        if self.park_during_pause:
+            gcode.extend(self._park_gcode('Park'))  # G53 park only if configured
         coolant_off = self._coolant_off_gcode()
         if coolant_off:
             gcode.append(coolant_off)
@@ -975,22 +1013,27 @@ class FRCPostProcessor:
         return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
 
     def classify_holes(self):
-        """Classify holes by diameter"""
+        """Classify holes by diameter.
+
+        Uses the HOLES bit when one is configured (set_holes_tool) - a smaller
+        dedicated bit makes smaller holes millable than the main tool would."""
         # Classify all circles as holes (apply size check)
         self.holes = []
+        holes_tool = self._holes_tool()
+        holes_min_millable = holes_tool * self.config.min_millable_hole_multiplier
 
         for circle in self.circles:
             diameter = circle['diameter']
             center = circle['center']
 
-            # Check if hole is too small to mill with this tool
-            if diameter < self.tool_diameter:
-                error_msg = f"Hole at ({center[0]:.3f}, {center[1]:.3f}) has diameter {diameter:.3f}\" which is too small for {self.tool_diameter:.3f}\" tool"
+            # Check if hole is too small to mill with the bit that cuts holes
+            if diameter < holes_tool:
+                error_msg = f"Hole at ({center[0]:.3f}, {center[1]:.3f}) has diameter {diameter:.3f}\" which is too small for {holes_tool:.3f}\" tool"
                 self._add_error(error_msg)
                 continue
 
             # Determine machining strategy based on hole size
-            if diameter < self.min_millable_hole:
+            if diameter < holes_min_millable:
                 # Hole is larger than tool but too small to helical entry
                 # Use peck drilling to get down, then spiral clear at bottom
                 strategy = 'peck+spiral'
@@ -1261,13 +1304,50 @@ class FRCPostProcessor:
         or contouring for large through-holes) followed by all pockets (fully cleared or
         contoured). Returns only the toolpath lines - no header/footer/perimeter.
 
+        When pause_after_holes is configured, a single "PAUSE FOR FIXTURING" is emitted
+        at the holes/contours boundary (screws go in through the fresh holes before any
+        through-cut starts releasing material) and the per-contour pauses are replaced
+        by it.
+
         Args:
             emit_contour_pauses: when True, emit the standalone "PAUSE FOR FIXTURING"
                 sequence before contoured holes/pockets (single-part behavior, gated by
                 pause_before_perimeter). The multi-part job assembler passes False because
-                it emits a single shared pause between all interiors and all perimeters.
+                it emits shared pauses between the collated phases instead.
         """
-        gcode = []
+        holes_gcode, middle, rest_gcode = self._generate_interior_sections(emit_contour_pauses)
+        return holes_gcode + middle + rest_gcode
+
+    def _generate_interior_sections(self, emit_contour_pauses: bool,
+                                    job_mode: bool = False):
+        """Build the interior toolpath split at the fixturing boundary.
+
+        The boundary sits after all CLEARED circular holes (the ones screws can go
+        through) and before everything that follows: contoured large holes, pocket
+        clearing, and pocket contours - i.e. before any cut that wants the part
+        screwed down.
+
+        Returns (holes_gcode, middle_gcode, rest_gcode):
+          holes_gcode: the HOLES section header, classification comments, and the
+              cleared-hole toolpath.
+          middle_gcode: the pause-after-holes sequence, when configured and applicable
+              (single-part mode only - empty in job_mode, where assemble_job_gcode
+              emits one shared pause between the collated HOLES and INTERIOR phases).
+          rest_gcode: contoured holes + all pockets.
+
+        job_mode: set by generate_part_phases. When splitting for a job
+            (pause_after_holes configured), rest_gcode becomes the start of its own
+            program phase - the tool re-enters from safe Z, so the first approach must
+            rapid down to the clearance plane (_pending_clearance_rapid).
+        """
+        # When the after-holes pause is on, it REPLACES the per-contour pauses: the
+        # part is already screwed down by the time any contour runs.
+        emit_contour_pauses = emit_contour_pauses and not self.pause_after_holes
+
+        gcode = []           # current append target; starts as the holes section
+        holes_gcode = gcode
+        cleared_holes = []
+        contoured_holes = []
 
         # Holes (all circular features - helical entry + spiral clearing, or contouring for large holes)
         if self.holes:
@@ -1281,9 +1361,6 @@ class FRCPostProcessor:
             is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
 
             # Separate holes into contoured and cleared based on size
-            contoured_holes = []
-            cleared_holes = []
-
             for i, hole in enumerate(self.holes, 1):
                 center = hole['center']
                 diameter = hole['diameter']
@@ -1305,16 +1382,45 @@ class FRCPostProcessor:
                     reason = "(partial depth)" if not is_through_cut else ""
                     gcode.append(f"(Hole {i} - {diameter:.3f}\" diameter, {hole_area:.3f} sq in - {strategy} {reason})")
 
-            # Process cleared holes first
+            # Process cleared holes first - with the HOLES bit when one is configured
+            # (helix radii, spiral stepover, and peck decisions all follow the bit
+            # that is actually in the spindle for this phase).
             if cleared_holes:
                 gcode.append("")
-                gcode.append("(--- Cleared holes ---)")
-                for i, hole, needs_peck in cleared_holes:
-                    center = hole['center']
-                    diameter = hole['diameter']
-                    gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
-                    gcode.append("")
+                if self._tool_change_needed():
+                    gcode.append(f"(--- Cleared holes - {self._holes_tool():.4f}\" holes bit ---)")
+                else:
+                    gcode.append("(--- Cleared holes ---)")
+                with self._tool_context(self._holes_tool()):
+                    for i, hole, needs_peck in cleared_holes:
+                        center = hole['center']
+                        diameter = hole['diameter']
+                        gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
+                        gcode.append("")
 
+        # ----- Boundary: cleared holes done, main-bit cutting about to start -----
+        # Stops here for screw fixturing (pause_after_holes) and/or a bit change. For
+        # a bit change, the PERIMETER counts as work after the boundary too - a part
+        # with only holes and a perimeter still needs the bit swapped before the
+        # perimeter cut.
+        middle = []
+        boundary_has_work_after = bool(contoured_holes or self.pockets or
+                                       (self._tool_change_needed() and getattr(self, 'perimeter', None)))
+        if self._boundary_needs_stop() and cleared_holes and boundary_has_work_after:
+            if job_mode:
+                # assemble_job_gcode emits the shared pause between the collated HOLES
+                # and INTERIOR phases; the rest section re-enters from safe Z there, so
+                # its first approach must rapid down to the clearance plane first.
+                self._pending_clearance_rapid = True
+            else:
+                middle = self._generate_pause_and_park_gcode(
+                    self._boundary_pause_title(),
+                    self._boundary_pause_instructions(job_mode=False)
+                )
+        rest_gcode = []
+        gcode = rest_gcode   # everything from here on is after the boundary
+
+        if self.holes:
             # Process contoured holes (with optional pause for fixturing)
             if contoured_holes:
                 # Optional pause before contoured holes for teams using screw fixturing
@@ -1359,34 +1465,45 @@ class FRCPostProcessor:
             # Only contour through-cuts; partial-depth features must be fully cleared
             is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
 
-            # Separate pockets into contoured and fully cleared based on size
+            # Separate pockets into contoured and fully cleared based on size. A pocket
+            # with a partial-depth override is ALWAYS fully cleared (it needs a flat
+            # bottom) and cuts to its own Z instead of through.
             contoured_pockets = []
-            cleared_pockets = []
+            cleared_pockets = []   # (i, pocket, area, cut_depth, partial_depth|None)
 
             for i, pocket in enumerate(self.pockets, 1):
                 pocket_poly = Polygon(pocket)
                 pocket_area = pocket_poly.area
+                pocket_cut_depth, partial = self._pocket_cut_depth(pocket)
+                pocket_through = is_through_cut and partial is None
 
                 # Calculate threshold area: contour_threshold × tool_diameter² / stepover
                 # Set contour_threshold to 0 to disable contouring entirely
                 threshold_area = (contour_threshold * self.tool_diameter**2 * self.stepover_percentage) if contour_threshold > 0 else float('inf')
 
                 # Only contour if it's a through-cut AND exceeds size threshold
-                if is_through_cut and pocket_area > threshold_area:
+                if pocket_through and pocket_area > threshold_area:
                     contoured_pockets.append((i, pocket, pocket_area))
                     gcode.append(f"(Pocket {i}: {pocket_area:.3f} sq in > {threshold_area:.3f} sq in threshold - will contour through-cut)")
                 else:
-                    cleared_pockets.append((i, pocket, pocket_area))
-                    reason = "- partial depth" if not is_through_cut else "- below threshold"
+                    cleared_pockets.append((i, pocket, pocket_area, pocket_cut_depth, partial))
+                    if partial is not None:
+                        reason = f"- partial depth {partial:.3f} in from top"
+                    else:
+                        reason = "- partial depth" if not is_through_cut else "- below threshold"
                     gcode.append(f"(Pocket {i}: {pocket_area:.3f} sq in - will fully clear {reason})")
 
             # Process fully cleared pockets first
             if cleared_pockets:
                 gcode.append("")
                 gcode.append("(--- Fully cleared pockets ---)")
-                for i, pocket, area in cleared_pockets:
-                    gcode.append(f"(Pocket {i} - {area:.3f} sq in)")
-                    gcode.extend(self._generate_pocket_gcode(pocket))
+                for i, pocket, area, pocket_cut_depth, partial in cleared_pockets:
+                    if partial is not None:
+                        gcode.append(f"(Pocket {i} - {area:.3f} sq in - partial depth {partial:.3f} in, bottom at Z{pocket_cut_depth:.4f})")
+                    else:
+                        gcode.append(f"(Pocket {i} - {area:.3f} sq in)")
+                    with self._cut_depth_context(pocket_cut_depth):
+                        gcode.extend(self._generate_pocket_gcode(pocket))
                     gcode.append("")
 
             # Process contoured pockets (with optional pause for fixturing)
@@ -1410,7 +1527,26 @@ class FRCPostProcessor:
                     gcode.extend(self._generate_pocket_contour_gcode(pocket))
                     gcode.append("")
 
-        return gcode
+        return holes_gcode, middle, rest_gcode
+
+    def _optimize_output(self, gcode_lines: List[str]) -> List[str]:
+        """Compress the fully-assembled program (collinear merge + arc refit).
+
+        Toolpaths are generated from Shapely polygons, one G1 per vertex, so the raw
+        program is enormous - a sampled DXF arc costs ~21 blocks for one fillet. This
+        final pass rewrites those runs as the few lines/arcs they geometrically are,
+        holding every point within gcode_compression_tolerance of the raw path.
+        Called on the complete line list right before joining, so it covers every
+        feature generator uniformly. See gcode_optimize.py for the safety rules.
+        """
+        if not self.gcode_compression_enabled:
+            return gcode_lines
+        tolerance = self.gcode_compression_tolerance
+        if self.units == "mm":
+            tolerance *= 25.4  # config value is inches; match mm-coordinate output
+        return optimize_gcode(gcode_lines,
+                              tolerance=tolerance,
+                              arc_fitting=self.gcode_arc_fitting)
 
     def generate_gcode(self, suggested_filename: str = None, timestamp: str = None,
                        include_header_footer: bool = True) -> PostProcessorResult:
@@ -1427,6 +1563,10 @@ class FRCPostProcessor:
         Returns:
             PostProcessorResult with gcode string and stats
         """
+        # Park safety first: a bad G53 park physically crashes the machine, so an
+        # invalid one (per soft limits) must block generation entirely.
+        self.check_park_safety()
+
         # Check for validation errors first
         if self.errors:
             print(f"\n❌ Cannot generate G-code: {len(self.errors)} validation error(s) found")
@@ -1447,7 +1587,7 @@ class FRCPostProcessor:
 
         # Generate header (skipped for job-body mode; assemble_job_gcode adds one shared header)
         gcode = self._generate_gcode_header(timestamp, is_multilayer=False) if include_header_footer else []
-        warnings = []
+        warnings = list(self.park_warnings)
 
         # Interior features (holes + pockets). Extracted to a shared helper so the
         # multi-part job assembler can collate interiors across parts. In single-part
@@ -1480,6 +1620,9 @@ class FRCPostProcessor:
         # Footer (skipped for job-body mode; assemble_job_gcode adds one shared footer)
         if include_header_footer:
             gcode.extend(self._generate_gcode_footer())
+
+        # Compress the assembled toolpath before estimating time and joining.
+        gcode = self._optimize_output(gcode)
 
         # Calculate estimated cycle time
         time_estimate = self._estimate_cycle_time(gcode)
@@ -1537,17 +1680,26 @@ class FRCPostProcessor:
         single-layer part (multi-part jobs are 2D standard mode; 2.5D is single-part).
 
         Returns a dict:
-            {'interior': [str], 'perimeter': [str], 'tab_removal': [str], 'errors': [str]}
+            {'holes': [str], 'interior': [str], 'perimeter': [str],
+             'tab_removal': [str], 'errors': [str]}
+        'holes' is non-empty only when pause_after_holes is configured - it carries the
+        cleared-hole toolpath as its own phase so the assembler can pause for screw
+        fixturing between all parts' holes and all parts' contours/pockets; otherwise
+        the holes stay at the front of 'interior' exactly as before.
         Coordinates are already in absolute job space (transform_coordinates applied the
         placement offset), so phases from different parts can be freely interleaved.
         """
+        # Park safety first (see check_park_safety) - an invalid park must fail the
+        # part rather than emit a G53 that drives through the stops.
+        self.check_park_safety()
+
         # Fail fast on pre-existing validation errors (same guard as generate_gcode).
         if self.errors:
-            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+            return {'holes': [], 'interior': [], 'perimeter': [], 'tab_removal': [],
                     'errors': self.errors.copy()}
 
         if self.layer_data:
-            return {'interior': [], 'perimeter': [], 'tab_removal': [],
+            return {'holes': [], 'interior': [], 'perimeter': [], 'tab_removal': [],
                     'errors': ['Multi-part jobs support single-layer (2D) parts only; '
                                'this part has multiple depth layers (2.5D).']}
 
@@ -1557,9 +1709,17 @@ class FRCPostProcessor:
         # _emit_phase), so the tool starts each phase up at safe height: flag the first
         # feature of each to rapid down to the clearance plane before its plunge feed.
 
-        # Phase A: interiors (holes + pockets), no per-feature pauses.
+        # Phase A: interiors (holes + pockets), no per-feature pauses. When the
+        # holes/contours boundary needs a stop (screw fixturing and/or a bit change),
+        # the cleared-hole toolpath is returned as its own phase so the assembler can
+        # collate all parts' holes, pause once, then run all parts' contours/pockets.
         self._pending_clearance_rapid = True
-        interior = self._generate_interior_gcode(emit_contour_pauses=False)
+        holes_section, _middle, rest_section = self._generate_interior_sections(
+            emit_contour_pauses=False, job_mode=True)
+        if self._boundary_needs_stop():
+            holes_phase, interior = holes_section, rest_section
+        else:
+            holes_phase, interior = [], holes_section + rest_section
 
         # Phase C: perimeter cut, deferring tab removal to phase D.
         perimeter = []
@@ -1576,7 +1736,7 @@ class FRCPostProcessor:
         if self.config.remove_tabs and self._deferred_tab_positions:
             tab_removal = self._generate_tab_removal_gcode(self._deferred_tab_positions)
 
-        return {'interior': interior, 'perimeter': perimeter,
+        return {'holes': holes_phase, 'interior': interior, 'perimeter': perimeter,
                 'tab_removal': tab_removal, 'errors': list(self.errors)}
 
     # ---- Portability helpers: work-coordinate safe moves + optional coolant/park -------
@@ -1615,6 +1775,47 @@ class FRCPostProcessor:
             f'G53 G0 Z{pz:.4f}  ; {comment}: raise to safe machine Z',
             f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
         ]
+
+    def check_park_safety(self):
+        """Validate the configured G53 park position before any G-code is emitted.
+
+        A park position is stated in HOMED machine coordinates - on most Mach3/GRBL
+        machines home is 0 and all valid travel is NEGATIVE, so a positive Y park on
+        such a machine drives the gantry through the physical stops, loses steps, and
+        corrupts position for the rest of the job (a real crash on the reference
+        machine motivated this check).
+
+        - With machine.soft_limits configured: an out-of-range park BLOCKS generation
+          (appends to self.errors).
+        - Without soft limits: the park cannot be validated, so a warning is recorded
+          on self.park_warnings for the UI and echoed into the program header.
+
+        Safe to call more than once per job (it deduplicates its own messages).
+        """
+        if not self.park_position:
+            return
+        px, py, pz = self.park_position
+        if self.soft_limits:
+            for axis, value in (('x', px), ('y', py), ('z', pz)):
+                pair = self.soft_limits.get(axis)
+                if pair is None:
+                    continue
+                lo, hi = pair
+                if value < lo - 1e-9 or value > hi + 1e-9:
+                    msg = (f"Park position {axis.upper()}{value:g} is outside the machine's "
+                           f"soft limits [{lo:g}, {hi:g}] (machine coordinates). The park "
+                           f"move would drive through the physical stops - fix "
+                           f"machine.park_position or machine.soft_limits in the config.")
+                    if msg not in self.errors:
+                        self._add_error(msg)
+        else:
+            msg = (f"Park position (machine X{px:g} Y{py:g} Z{pz:g}) is NOT validated: no "
+                   f"machine.soft_limits configured. Most Mach3/GRBL machines home to 0 "
+                   f"with NEGATIVE travel - if your DRO shows negative machine coordinates, "
+                   f"this park will crash the gantry into the stops. Jog to the desired "
+                   f"park spot, read the MACHINE coordinate DRO, and use those exact values.")
+            if msg not in self.park_warnings:
+                self.park_warnings.append(msg)
 
     def _tube_wcs_activate_gcode(self) -> str:
         """The work-coordinate-system line that opens a tube program. Default G54 (the
@@ -1707,6 +1908,19 @@ class FRCPostProcessor:
             gcode.append("(Plane: G17 - XY)")
             gcode.append("(Arc centers: Incremental - G91.1)")
 
+        # Disclose machine-coordinate motion up front: the operator can sanity-check
+        # the park against their DRO before pressing cycle start.
+        if self.park_position:
+            px, py, pz = self.park_position
+            gcode.append(f"(Park: G53 machine X{px:g} Y{py:g} Z{pz:g})")
+            if self.soft_limits:
+                lim = ', '.join(f"{a.upper()} {v[0]:g} to {v[1]:g}"
+                                for a, v in sorted(self.soft_limits.items()))
+                gcode.append(f"(Machine soft limits: {lim} - park validated)")
+            else:
+                gcode.append("(WARNING: park NOT validated - no machine soft_limits configured)")
+                gcode.append("(  Verify X/Y/Z above against your MACHINE coordinate DRO before running)")
+
         gcode.append("")
 
         # Material and tool
@@ -1718,6 +1932,8 @@ class FRCPostProcessor:
 
         gcode.append(f"(Material: {material_info})")
         gcode.append(f"(Tool: {self.tool_diameter}\" diam Flat End Mill)")
+        if self._tool_change_needed() and getattr(self, 'holes', None):
+            gcode.append(f"(Holes bit: {self.holes_tool_diameter}\" diam - START with this bit, change at the pause)")
         gcode.append(f"(Spindle: {self.spindle_speed} RPM)")
 
         if is_job and job_part_count is not None:
@@ -2577,6 +2793,9 @@ class FRCPostProcessor:
 
         # Footer
         gcode.extend(self._generate_gcode_footer())
+
+        # Compress the assembled toolpath before estimating time and joining.
+        gcode = self._optimize_output(gcode)
 
         # Calculate estimated cycle time
         time_estimate = self._estimate_cycle_time(gcode)
@@ -3604,6 +3823,342 @@ class FRCPostProcessor:
 
         return gcode
 
+    def set_tab_overrides(self, enabled=None, exclusions=None, positions=None):
+        """Per-part perimeter tab overrides from the wizard's Tabs & Fixtures step.
+
+        Args:
+            enabled: True/False to force perimeter tabs on/off for this part,
+                None to follow the team config. Pocket-contour tabs are unaffected.
+            exclusions: list of ((ax, ay), (bx, by)) point pairs in job space. Each
+                pair excludes the SHORTER arc of the perimeter between the two points'
+                projections from automatic tab placement.
+            positions: list of (x, y) job-space points. When not None, automatic
+                placement is replaced entirely: one tab is centered at each point's
+                projection onto the tool-compensated perimeter. An empty list means
+                zero tabs (a warning is recorded).
+        """
+        self.tab_override_enabled = enabled
+        self.tab_exclusions = [((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
+                               for a, b in (exclusions or [])]
+        self.tab_positions = None if positions is None else \
+            [(float(p[0]), float(p[1])) for p in positions]
+
+    def _perimeter_tabs_enabled(self) -> bool:
+        """Effective tabs-on state for the part perimeter (override beats config)."""
+        if self.tab_override_enabled is not None:
+            return bool(self.tab_override_enabled)
+        return self.tabs_enabled
+
+    # ---- Two-bit jobs (holes bit + main bit) --------------------------------------
+
+    def set_holes_tool(self, diameter):
+        """Use a separate bit for circular holes (None/0/main-diameter = single bit).
+
+        Call BEFORE classify_holes so the too-small/peck decisions are made with the
+        bit that will actually cut the holes."""
+        if diameter is None:
+            self.holes_tool_diameter = None
+            return
+        diameter = float(diameter)
+        if diameter <= 0 or abs(diameter - self.tool_diameter) < 1e-9:
+            self.holes_tool_diameter = None
+        else:
+            self.holes_tool_diameter = diameter
+
+    def _tool_change_needed(self) -> bool:
+        return self.holes_tool_diameter is not None
+
+    def _holes_tool(self) -> float:
+        """The bit that cuts cleared circular holes."""
+        return self.holes_tool_diameter or self.tool_diameter
+
+    @contextlib.contextmanager
+    def _tool_context(self, diameter):
+        """Temporarily generate with a different bit (used for the holes phase)."""
+        saved = (self.tool_diameter, self.tool_radius, self.min_millable_hole)
+        self.tool_diameter = diameter
+        self.tool_radius = diameter / 2
+        self.min_millable_hole = diameter * self.config.min_millable_hole_multiplier
+        try:
+            yield
+        finally:
+            self.tool_diameter, self.tool_radius, self.min_millable_hole = saved
+
+    def _boundary_needs_stop(self) -> bool:
+        """Whether the holes/contours boundary must stop the machine: for screw
+        fixturing (pause_after_holes) and/or a bit change."""
+        return self.pause_after_holes or self._tool_change_needed()
+
+    def _boundary_pause_title(self) -> str:
+        if self._tool_change_needed() and self.pause_after_holes:
+            return 'PAUSE - CHANGE BIT + FIXTURING'
+        if self._tool_change_needed():
+            return 'PAUSE - CHANGE BIT'
+        return 'PAUSE FOR FIXTURING'
+
+    def _boundary_pause_instructions(self, job_mode: bool) -> List[str]:
+        """Operator instructions for the holes/contours boundary pause."""
+        lines = []
+        if self._tool_change_needed():
+            lines.append(f'CHANGE BIT: holes used the {self._holes_tool():.4f}" bit,'
+                         f' install the {self.tool_diameter:.4f}" bit now')
+            lines.append('RE-ZERO Z to the sacrifice board with the new bit')
+        if self.pause_after_holes:
+            if job_mode:
+                lines.append("All parts' circular holes complete")
+                lines.append('Install screws through holes into sacrifice board on ALL parts')
+                lines.append('Fixture every part securely before contour cutting begins')
+            else:
+                lines.append('All circular holes complete')
+                lines.append('Install screws through holes into sacrifice board')
+                lines.append('Fixture part securely before contour cutting begins')
+        return lines
+
+    # ---- Per-pocket partial depths -------------------------------------------------
+
+    def set_pocket_depths(self, overrides):
+        """Per-pocket partial-depth overrides: [((x, y), depth_inches_from_top), ...].
+        The point identifies the pocket (any point inside it, job space)."""
+        clean = []
+        for pt, depth in (overrides or []):
+            try:
+                d = float(depth)
+                if d > 0:
+                    clean.append(((float(pt[0]), float(pt[1])), d))
+            except (TypeError, ValueError):
+                continue
+        self.pocket_depth_overrides = clean
+
+    def _pocket_cut_depth(self, pocket_points):
+        """The Z this pocket cuts to: the through-cut depth (self.cut_depth) unless a
+        partial-depth override point lands inside it. Depths at or beyond the material
+        thickness mean 'through' and use the normal through-cut depth."""
+        if not self.pocket_depth_overrides:
+            return self.cut_depth, None
+        poly = Polygon(pocket_points)
+        for (px, py), depth in self.pocket_depth_overrides:
+            if poly.contains(Point(px, py)):
+                if depth >= self.material_thickness - 1e-6:
+                    return self.cut_depth, None      # full depth requested = through
+                return self.material_top - depth, depth
+        return self.cut_depth, None
+
+    @contextlib.contextmanager
+    def _cut_depth_context(self, cut_depth):
+        """Temporarily generate to a different target Z (partial-depth pockets)."""
+        saved = self.cut_depth
+        self.cut_depth = cut_depth
+        try:
+            yield
+        finally:
+            self.cut_depth = saved
+
+    @staticmethod
+    def _subtract_intervals(base, cuts):
+        """Subtract `cuts` from `base`; both are lists of (start, end) with start<end.
+        Returns the remaining intervals, sorted."""
+        result = list(base)
+        for cs, ce in cuts:
+            next_result = []
+            for s, e in result:
+                if ce <= s or cs >= e:
+                    next_result.append((s, e))
+                    continue
+                if cs > s:
+                    next_result.append((s, cs))
+                if ce < e:
+                    next_result.append((ce, e))
+            result = next_result
+        return sorted(result)
+
+    def _compute_tab_zones(self, offset_points, contour_length, ramp_distance,
+                           apply_overrides):
+        """Compute perimeter tab zones as (start_dist, end_dist) along the offset
+        contour, honoring the part's overrides when apply_overrides is True.
+
+        With no overrides this reproduces the historical layout exactly: tabs evenly
+        spaced through the post-ramp cutting length, minimum 3.
+
+        Returns (zones, comments, meta):
+            zones: list of (start, end) distances. A zone lying in the pre-ramp region
+                [0, ramp_distance) is also emitted shifted by +contour_length so the
+                wrapped closing portion of the cut (whose distances run past
+                contour_length) can match it.
+            comments: G-code comment lines describing the layout.
+            meta: {'count': tab count, 'excluded': [(s, e), ...] exclusion intervals}
+        """
+        comments = []
+        half = self.tab_width / 2
+        L = contour_length
+        ring = LineString(list(offset_points) + [offset_points[0]])
+
+        custom = None
+        excluded = []
+        if apply_overrides:
+            if self.tab_positions is not None:
+                custom = sorted(ring.project(Point(p)) for p in self.tab_positions)
+            for a, b in self.tab_exclusions:
+                da, db = ring.project(Point(a)), ring.project(Point(b))
+                lo, hi = sorted((da, db))
+                if (hi - lo) <= (L - (hi - lo)):
+                    excluded.append((lo, hi))          # arc not crossing the start
+                else:
+                    excluded.append((hi, L))           # shorter arc wraps the start
+                    excluded.append((0.0, lo))
+
+        zones = []
+        if custom is not None:
+            for center in custom:
+                s, e = center - half, center + half
+                if s < 0:
+                    zones.append((s + L, L))
+                    zones.append((0.0, e))
+                elif e > L:
+                    zones.append((s, L))
+                    zones.append((0.0, e - L))
+                else:
+                    zones.append((s, e))
+            count = len(custom)
+            comments.append(f"(Tabs: {count} custom positions - width: {self.tab_width:.4f}\")")
+            if any(s < ramp_distance for s, e in zones):
+                comments.append("(Note: a tab near the lead-in may be thinned by the entry ramp)")
+        elif not excluded:
+            # Historical auto layout, byte-identical to the pre-override behavior.
+            cutting_length = L - ramp_distance
+            num_tabs = max(3, int(math.ceil(cutting_length / self.tab_spacing)))
+            actual_tab_spacing = cutting_length / num_tabs
+            for i in range(num_tabs):
+                center = ramp_distance + actual_tab_spacing * (i + 0.5)
+                zones.append((center - half, center + half))
+            count = num_tabs
+            comments.append(f"(Tabs: {num_tabs} tabs - desired spacing: {self.tab_spacing:.2f}\", actual: {actual_tab_spacing:.2f}\" - width: {self.tab_width:.4f}\")")
+        else:
+            # Auto layout constrained to the allowed (non-excluded, post-ramp) arcs.
+            allowed = self._subtract_intervals([(ramp_distance, L)], excluded)
+            allowed = [(s, e) for s, e in allowed if (e - s) >= self.tab_width]
+            total = sum(e - s for s, e in allowed)
+            count = 0
+            if total > 0:
+                num_tabs = max(3, int(math.ceil(total / self.tab_spacing)))
+                # Largest-remainder split of num_tabs across the allowed arcs, capped
+                # by how many tabs physically fit in each.
+                quotas = [(num_tabs * (e - s) / total, i) for i, (s, e) in enumerate(allowed)]
+                counts = [int(q) for q, _ in quotas]
+                for _, i in sorted(quotas, key=lambda t: -(t[0] - int(t[0]))):
+                    if sum(counts) >= num_tabs:
+                        break
+                    counts[i] += 1
+                for (s, e), n in zip(allowed, counts):
+                    n = min(n, int((e - s) / self.tab_width))
+                    for k in range(n):
+                        center = s + (e - s) * (k + 0.5) / max(n, 1)
+                        zones.append((center - half, center + half))
+                    count += n
+            comments.append(f"(Tabs: {count} tabs across {len(allowed)} allowed regions - "
+                            f"{len(excluded)} excluded regions - width: {self.tab_width:.4f}\")")
+
+        # Custom zones in the pre-ramp region are only reachable via the wrapped
+        # closing portion of the cut, whose running distance exceeds contour_length.
+        # (Auto zones always start at or after the ramp, so this never fires there -
+        # keeping default output identical to the pre-override behavior.)
+        if custom is not None:
+            zones.extend((s + L, e + L) for s, e in list(zones) if s < ramp_distance)
+
+        if apply_overrides and self._perimeter_tabs_enabled() and count < 3:
+            msg = (f"Only {count} perimeter tab(s) on this part - it may come loose "
+                   f"before the cut finishes. Add tabs or fixture the part securely.")
+            comments.append(f"(WARNING: {count} tabs only - part may release early)")
+            self.tab_warnings.append(msg)
+
+        return zones, comments, {'count': count, 'excluded': excluded}
+
+    def _point_at_contour_distance(self, offset_points, segment_lengths, distance):
+        """XY at a running distance along the closed offset contour."""
+        total = sum(segment_lengths)
+        d = distance % total if total > 0 else 0.0
+        for i, seg_len in enumerate(segment_lengths):
+            if d <= seg_len or i == len(segment_lengths) - 1:
+                p1 = offset_points[i]
+                p2 = offset_points[(i + 1) % len(offset_points)]
+                t = (d / seg_len) if seg_len > 0 else 0.0
+                return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+            d -= seg_len
+        return offset_points[0]
+
+    def compute_perimeter_tab_layout(self):
+        """The perimeter tab layout this part would be cut with, without generating
+        G-code. Single source of truth for the wizard's Tabs & Fixtures step: the same
+        zone computation used by _generate_contour_gcode, mapped to job-space XY.
+
+        Returns None when the part has no perimeter, else a dict:
+            {'enabled': bool,
+             'contour': [[x, y], ...],           # tool-compensated perimeter (cut path)
+             'ramp': [[x, y], ...],              # lead-in span along the contour
+             'tabs': [{'x','y','start':[x,y],'end':[x,y]}, ...],
+             'excluded': [[[x, y], ...], ...],   # excluded spans, sampled for display
+             'warnings': [...]}
+        """
+        if not getattr(self, 'perimeter', None):
+            return None
+        self.tab_warnings = []
+
+        contour_poly = Polygon(self.perimeter)
+        offset_poly = contour_poly.buffer(self.tool_radius)
+        if offset_poly.is_empty or not hasattr(offset_poly, 'exterior'):
+            return None
+        offset_poly = orient(offset_poly, 1.0)
+        offset_points = list(offset_poly.exterior.coords)[:-1]
+        offset_points = offset_points[::-1]   # perimeter cuts clockwise (climb)
+
+        segment_lengths = [self._distance_2d(offset_points[i],
+                                             offset_points[(i + 1) % len(offset_points)])
+                           for i in range(len(offset_points))]
+        contour_length = sum(segment_lengths)
+
+        ramp_start_height = self.material_top + self.ramp_start_clearance
+        ramp_distance = (ramp_start_height - self.cut_depth) / math.tan(math.radians(self.ramp_angle))
+
+        enabled = self._perimeter_tabs_enabled()
+        tabs = []
+        excluded_spans = []
+        if enabled:
+            zones, _comments, meta = self._compute_tab_zones(
+                offset_points, contour_length, ramp_distance, apply_overrides=True)
+            seen = set()
+            for s, e in zones:
+                if s >= contour_length:
+                    continue   # wrapped duplicate for cut matching; same physical spot
+                key = round(s, 4)
+                if key in seen:
+                    continue
+                seen.add(key)
+                mid = self._point_at_contour_distance(offset_points, segment_lengths, (s + e) / 2)
+                tabs.append({
+                    'x': mid[0], 'y': mid[1],
+                    'start': list(self._point_at_contour_distance(offset_points, segment_lengths, max(s, 0.0))),
+                    'end': list(self._point_at_contour_distance(offset_points, segment_lengths, min(e, contour_length))),
+                })
+            for s, e in meta['excluded']:
+                span = []
+                steps = max(2, int((e - s) / 0.1))
+                for k in range(steps + 1):
+                    span.append(list(self._point_at_contour_distance(
+                        offset_points, segment_lengths, s + (e - s) * k / steps)))
+                excluded_spans.append(span)
+
+        ramp_span = []
+        steps = max(2, int(min(ramp_distance, contour_length) / 0.1))
+        for k in range(steps + 1):
+            ramp_span.append(list(self._point_at_contour_distance(
+                offset_points, segment_lengths, min(ramp_distance, contour_length) * k / steps)))
+
+        return {'enabled': enabled,
+                'contour': [list(p) for p in offset_points],
+                'ramp': ramp_span,
+                'tabs': tabs,
+                'excluded': excluded_spans,
+                'warnings': list(self.tab_warnings)}
+
     def _generate_contour_gcode(self,
                                contour_points: List[Tuple[float, float]],
                                contour_type: str,
@@ -3708,26 +4263,18 @@ class FRCPostProcessor:
             ramp_distance = ramp_depth / math.tan(math.radians(self.ramp_angle))
             gcode.append(f"(Ramp-in: {ramp_distance:.4f}\" at {self.ramp_angle} deg)")
 
-            # Calculate tab zones ONLY on final pass (if tabs are enabled)
+            # Calculate tab zones ONLY on final pass (if tabs are enabled). The part
+            # perimeter honors the wizard's per-part overrides (exclusion regions,
+            # custom positions, forced on/off); pocket contours stay config-driven.
+            is_part_perimeter = (contour_type == 'perimeter')
+            tabs_on = self._perimeter_tabs_enabled() if is_part_perimeter else self.tabs_enabled
             tab_zones = []  # List of (start_dist, end_dist) tuples
-            if is_final_pass and self.tabs_enabled:
-                # We cut from ramp_distance to contour_length, so tabs should only be in that range
-                cutting_length = contour_length - ramp_distance
-
-                # Calculate number of tabs based on desired spacing, with minimum of 3
-                num_tabs = max(3, int(math.ceil(cutting_length / self.tab_spacing)))
-                actual_tab_spacing = cutting_length / num_tabs
-
-                # Place tabs starting after the ramp, centered in each section
-                half_tab_width = self.tab_width / 2
-                for i in range(num_tabs):
-                    tab_center = ramp_distance + actual_tab_spacing * (i + 0.5)
-                    tab_start = tab_center - half_tab_width
-                    tab_end = tab_center + half_tab_width
-                    tab_zones.append((tab_start, tab_end))
-
-                gcode.append(f"(Tabs: {num_tabs} tabs - desired spacing: {self.tab_spacing:.2f}\", actual: {actual_tab_spacing:.2f}\" - width: {self.tab_width:.4f}\")")
-            elif is_final_pass and not self.tabs_enabled:
+            if is_final_pass and tabs_on:
+                tab_zones, tab_comments, _meta = self._compute_tab_zones(
+                    offset_points, contour_length, ramp_distance,
+                    apply_overrides=is_part_perimeter)
+                gcode.extend(tab_comments)
+            elif is_final_pass:
                 gcode.append(f"(Tabs disabled - perimeter will be cut through completely)")
 
             # Move to start
@@ -4439,6 +4986,12 @@ class FRCPostProcessor:
         Returns:
             PostProcessorResult with gcode string and stats
         """
+        # Park safety first: an invalid G53 park must fail generation, and an
+        # unvalidated one is surfaced as a warning (see check_park_safety).
+        self.check_park_safety()
+        if self.errors:
+            return PostProcessorResult(success=False, errors=self.errors.copy())
+
         # Parse tube dimensions
         tube_width, tube_height = self._parse_tube_size(tube_size)
 
@@ -4647,6 +5200,12 @@ class FRCPostProcessor:
         Returns:
             PostProcessorResult with gcode string and stats
         """
+        # Park safety first: an invalid G53 park must fail generation, and an
+        # unvalidated one is surfaced as a warning (see check_park_safety).
+        self.check_park_safety()
+        if self.errors:
+            return PostProcessorResult(success=False, errors=self.errors.copy())
+
         # Check for validation errors first (both faces, in two-face mode).
         combined_errors = list(self.errors)
         if second_face_pp is not None:
@@ -5412,7 +5971,8 @@ def validate_job_layout(parts, machine_x_max, machine_y_max, min_gap=0.0):
     return errors
 
 
-def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None):
+def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None,
+                       fixture_notes=None):
     """Stitch per-part G-code phases into one multi-part program, collated by phase.
 
     Rather than running each part to completion before the next, the whole job is
@@ -5425,19 +5985,25 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     Args:
         part_jobs: ordered list of dicts:
             {'name': str, 'place_x': float, 'place_y': float, 'rotation': float,
-             'interior': [str], 'perimeter': [str], 'tab_removal': [str]}
-            -- the three phase line-lists from FRCPostProcessor.generate_part_phases().
+             'holes': [str], 'interior': [str], 'perimeter': [str], 'tab_removal': [str]}
+            -- the phase line-lists from FRCPostProcessor.generate_part_phases().
+            'holes' may be absent/empty (it is populated only under pause_after_holes).
         header_pp: an FRCPostProcessor carrying the shared job parameters (material,
             tool, thickness, spindle, park Z, pause_before_perimeter). Used to build the
             single header/footer, the shared pause, and estimate total cycle time.
             (v1: one tool/material per job.)
         timestamp, suggested_filename: as in generate_gcode.
+        fixture_notes: optional list of operator-hint strings (screw locations marked
+            in the wizard) appended to the fixturing pause instructions. Comment
+            text only - sanitized ASCII, no parentheses.
 
     Returns:
         PostProcessorResult with the assembled program and aggregate stats.
     """
     if not timestamp:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fixture_notes = [str(n).replace('(', '[').replace(')', ']')
+                     for n in (fixture_notes or [])][:24]
 
     gcode = header_pp._generate_gcode_header(timestamp, is_job=True, job_part_count=len(part_jobs))
 
@@ -5465,7 +6031,27 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
             gcode.extend(pj[phase_key])
         return True
 
-    # Phase A: all parts' interior features.
+    # Phase A0/A1: when pause_after_holes is configured, all parts' cleared holes run
+    # first, then one shared fixturing pause (screws through the fresh holes), then all
+    # parts' contours/pockets. With the option off, 'holes' is empty on every part and
+    # the whole interior runs as one phase, exactly as before.
+    fixture_notes_emitted = False
+    emitted_holes = _emit_phase("PHASE: HOLES", 'holes')
+    has_more_interior = any(pj.get('interior') for pj in part_jobs)
+    job_has_perimeters = any(pj.get('perimeter') for pj in part_jobs)
+    # A bit change must also stop before perimeter-only main-bit work (a job of
+    # holes + perimeters with no pockets still needs the bit swapped).
+    boundary_work_after = has_more_interior or (header_pp._tool_change_needed()
+                                                and job_has_perimeters)
+    if header_pp._boundary_needs_stop() and emitted_holes and boundary_work_after:
+        gcode.extend(header_pp._generate_pause_and_park_gcode(
+            header_pp._boundary_pause_title(),
+            header_pp._boundary_pause_instructions(job_mode=True) + fixture_notes
+        ))
+        fixture_notes_emitted = bool(fixture_notes)
+
+    # Phase A: all parts' interior features (contours + pockets when the holes phase
+    # was split out, the whole interior otherwise).
     _emit_phase("PHASE: INTERIOR FEATURES", 'interior')
 
     # Phase B: one shared refixturing pause between interiors and perimeters, if
@@ -5478,8 +6064,18 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
                 "All parts' internal features complete",
                 'Install screws through holes into sacrifice board on ALL parts',
                 'Fixture every part securely before perimeter cutting'
-            ]
+            ] + fixture_notes
         ))
+        fixture_notes_emitted = fixture_notes_emitted or bool(fixture_notes)
+
+    # Screw locations were marked in the wizard but no fixturing pause is configured:
+    # still record them as comments before the perimeters so the operator sheet isn't
+    # silently lost.
+    if fixture_notes and not fixture_notes_emitted and has_perimeters:
+        gcode.append('')
+        gcode.append('(Fixture screw locations, marked in the wizard:)')
+        for note in fixture_notes:
+            gcode.append(f'( {note} )')
 
     # Phase C: all parts' perimeters (tab removal deferred to phase D).
     _emit_phase("PHASE: PERIMETERS", 'perimeter')
@@ -5488,6 +6084,9 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     _emit_phase("PHASE: TAB REMOVAL", 'tab_removal')
 
     gcode.extend(header_pp._generate_gcode_footer())
+
+    # Compress the assembled program before estimating time and joining.
+    gcode = header_pp._optimize_output(gcode)
 
     # Estimate total cycle time across the whole program and insert into the header.
     time_estimate = header_pp._estimate_cycle_time(gcode)

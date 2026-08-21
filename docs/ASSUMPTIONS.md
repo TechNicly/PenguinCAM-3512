@@ -19,6 +19,15 @@ every controller supports:
 * **`park_position`** (machine-coordinate park) → emits `G53` machine moves. Leave it out
   for controllers that don't support `G53` (e.g. GRBL behaves unexpectedly). This is
   the ONLY thing that puts `G53` in the output.
+  **The values are HOMED machine coordinates in the controller's own convention** — on
+  most Mach3/GRBL machines home is 0 and all travel is NEGATIVE; a positive value on
+  such a machine drives through the physical stops. Configure `machine.soft_limits`
+  (e.g. `x: [-22.2, 0]`) and every park is validated against them: an out-of-range park
+  **fails generation** instead of emitting the move. Without soft limits, the program
+  header carries a warning and the park is echoed for the operator to verify against
+  the DRO. `machining.fixturing.park_during_pause: false` makes mid-job pauses raise
+  to safe Z and stop in place (no G53 during the job); the end-of-program park is
+  unaffected.
 * **`machine.coolant`** (`Air`/`Mist`/`Flood`) → emits `M7`/`M8`/`M9`. Leave it out (or set
   `None`) on controllers without coolant M-codes (stock GRBL rejects `M7` unless compiled
   with it).
@@ -60,3 +69,36 @@ general G-code sender rather than importing it into Easel.
   default.
 * If you enable `park_position`, then (and only then) the program assumes machine Z=0 is a
   safe high position, since the park raises to `G53 Z<park_z>`.
+
+---
+
+## 4. Output Toolpath Compression (arcs in the output)
+
+Toolpaths are computed as dense polylines (one vertex per sampled arc chord / polygon
+offset vertex). As the **final step** of generation, `gcode_optimize.py` compresses runs
+of short `G1` moves: exact duplicates are dropped, collinear runs merge into one `G1`,
+and chord sequences that describe a circle are re-fit into a single `G2`/`G3`
+(incremental `I J` centers, matching the `G91.1` header). This typically shrinks a
+program ~2–3x, which matters for controllers like **Mach3** that stall (and fail to
+render the toolpath preview) on very large files of very short blocks.
+
+Assumptions and guarantees:
+
+* The compressed path stays within `machining.output.tolerance` (default **0.0005"**) of
+  the raw toolpath; run endpoints (plunges, tab starts/ends, ramp ends) are preserved
+  exactly.
+* Every emitted arc's start/end radii agree within 0.0002" at the printed 4-decimal
+  precision, so controllers that validate arc radius consistency (Mach3) accept them.
+* Arcs are emitted only for spans between ~5° and ~350° of sweep — never full circles.
+* The controller must support `G2`/`G3` with `G91.1` incremental centers (already
+  required by helical entries, see section 1). If a controller can't take arcs at all,
+  set `machining.output.arc_fitting: false`; to ship the raw uncompressed toolpath, set
+  `machining.output.compression: false`.
+
+```yaml
+machining:
+  output:
+    compression: true     # default
+    tolerance: 0.0005     # inches of allowed path deviation
+    arc_fitting: true     # emit G2/G3 during compression
+```

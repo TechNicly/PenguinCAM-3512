@@ -9,11 +9,14 @@
   var CFG = window.PenguinCAM || { source: 'upload', bed: { width: 24, height: 24 }, defaultTool: 0.157, defaultToolText: '4mm', machines: {} };
   var DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 
-  var ALL_STEPS = ['setup', 'parts', 'layout', 'preview'];
+  var ALL_STEPS = ['setup', 'parts', 'layout', 'tabs', 'preview'];
   // Every mode uses the Layout step. In 2D it nests parts on a sheet; in tubing it's
   // used only to orient the face(s) to the tube-jig axis (see the tube handling in the
   // rotate + validate paths below). 2.5D is a single part positioned at the origin.
+  // The Tabs & Fixtures step is 2D-only: tab overrides ride the /process-job payload,
+  // and the single-part (2.5D) and tubing paths don't take them.
   function steps() {
+    if (state.mode !== '2d') return ALL_STEPS.filter(function (s) { return s !== 'tabs'; });
     return ALL_STEPS;
   }
 
@@ -25,6 +28,7 @@
     material: 'plywood',
     tool_diameter: parseFloat(CFG.defaultTool) || 0.157,
     tool_diameter_text: CFG.defaultToolText || '4mm',  // user's raw input, shown verbatim (e.g. "4mm")
+    holes_tool: null,     // optional dedicated bit for circular holes (inches), null = same bit
     thickness: 0.25,
     thickness_text: '0.25"',
     tab_spacing: 6.0,
@@ -176,7 +180,55 @@
         return [c[0] - minX, c[1] - minY];
       });
     });
-    return { pts: norm, holes: holes, inner: inner, w: maxX - minX, h: maxY - minY };
+    // rminX/rminY: the rotated point cloud's bbox minimum before normalization -
+    // needed to invert this mapping (see localToSheet / sheetToLocal).
+    return { pts: norm, holes: holes, inner: inner, w: maxX - minX, h: maxY - minY,
+             rminX: minX, rminY: minY };
+  }
+
+  // Map a point between a part's LOCAL outline frame (the /part-outline coordinates,
+  // stable under moves/rotations/flips - overrides are stored in this frame) and
+  // SHEET coordinates (the layout canvas world). Mirrors placedShape exactly.
+  function localToSheet(part, x, y) {
+    var fx = part.flipped ? -1 : 1;
+    var r = rotatePoint(fx * x, y, part.rotation);
+    var pl = placement(part);
+    return [pl.x + r[0] - pl.shape.rminX, pl.y + r[1] - pl.shape.rminY];
+  }
+  function sheetToLocal(part, sx, sy) {
+    var pl = placement(part);
+    var vx = sx - pl.x + pl.shape.rminX, vy = sy - pl.y + pl.shape.rminY;
+    var r = rotatePoint(vx, vy, -part.rotation);
+    var fx = part.flipped ? -1 : 1;
+    return [fx * r[0], r[1]];
+  }
+
+  // Per-part tab overrides + fixture screws, created on first edit. All coordinates
+  // are part-local so they survive layout changes.
+  function tabOv(p) {
+    if (!p.tabsOv) p.tabsOv = { enabled: null, exclusions: [], positions: null };
+    return p.tabsOv;
+  }
+
+  // The overrides serialized for the server, converted local -> job space
+  // (job space = sheet minus the combined bbox minimum, same frame as place_x/y).
+  function tabsPayloadFor(p, bbMin) {
+    function lj(pt) {
+      var s = localToSheet(p, pt[0], pt[1]);
+      return [s[0] - bbMin[0], s[1] - bbMin[1]];
+    }
+    var ov = p.tabsOv || {};
+    return {
+      tabs: {
+        enabled: (ov.enabled === undefined ? null : ov.enabled),
+        exclusions: (ov.exclusions || []).map(function (pr) { return [lj(pr[0]), lj(pr[1])]; }),
+        positions: (ov.positions == null) ? null : ov.positions.map(lj),
+      },
+      fixtures: (p.fixtures || []).map(lj),
+      pocket_depths: (p.pocketDepths || []).map(function (o) {
+        return { at: lj(o.pt), depth: o.depth };
+      }),
+    };
   }
 
   // Parts are stored by their center (cx, cy) so rotation happens in place. The
@@ -376,6 +428,13 @@
       refitView();
       drawLayout();
     }
+    if (name === 'tabs') {
+      tabsUi.pending = null;
+      tabsRefit();
+      drawTabs();
+      updateTabsToolbar();
+      requestTabPreview();
+    }
     if (isPreview) {
       state.saveAction = preferredAction();
       $('#btn-do').disabled = true;   // enabled once generation finishes
@@ -423,6 +482,49 @@
     gotoStep(name);
   }
 
+  /* ------------------------------------------------- machine & safety */
+  // Optional soft limits + pause-park behavior (Setup step, collapsed by default).
+  // Prefilled from the team config; blank fields skip validation for that axis.
+  function bindMachineSafety() {
+    var park = CFG.park;   // [x, y, z] machine coords, or null
+    var info = $('#park-info');
+    if (info) {
+      info.textContent = park ?
+        ('Configured park (machine coords): X' + park[0] + ' Y' + park[1] + ' Z' + park[2] +
+         ' - verify against your machine-coordinate DRO.') :
+        'No park position configured - programs stay in work coordinates (no G53).';
+    }
+    var wrap = $('#park-pause-wrap');
+    if (wrap) wrap.hidden = !park;
+    var cb = $('#f-park-pause');
+    if (cb) cb.checked = CFG.parkDuringPause !== false;
+    var lim = CFG.softLimits || {};
+    ['x', 'y', 'z'].forEach(function (axis) {
+      var pair = lim[axis];
+      if (!pair) return;
+      var lo = $('#f-lim-' + axis + 'min'), hi = $('#f-lim-' + axis + 'max');
+      if (lo) lo.value = pair[0];
+      if (hi) hi.value = pair[1];
+    });
+  }
+
+  // The job-level machine_safety payload, read from the panel at submit time.
+  // Only axes with BOTH bounds filled are sent; an empty object means "config
+  // defaults" server-side.
+  function collectMachineSafety() {
+    var out = {};
+    var limits = {};
+    ['x', 'y', 'z'].forEach(function (axis) {
+      var lo = parseFloat(($('#f-lim-' + axis + 'min') || {}).value);
+      var hi = parseFloat(($('#f-lim-' + axis + 'max') || {}).value);
+      if (isFinite(lo) && isFinite(hi)) limits[axis] = [lo, hi];
+    });
+    if (Object.keys(limits).length) out.soft_limits = limits;
+    var cb = $('#f-park-pause');
+    if (cb && CFG.park) out.park_during_pause = cb.checked;
+    return out;
+  }
+
   /* --------------------------------------------------------------- setup */
   function bindSetup() {
     var machineSel = $('#f-machine');
@@ -445,6 +547,16 @@
     bindLengthField($('#f-thickness'),
       function () { return state.thickness_text; },
       function (inches, text) { state.thickness = inches; state.thickness_text = text; });
+    // Holes bit: blank means "one bit for everything", so bind manually rather than
+    // through bindLengthField (which treats blank as invalid input).
+    var holesBit = $('#f-holes-bit');
+    if (holesBit) holesBit.addEventListener('change', function () {
+      var text = this.value.trim();
+      if (!text) { state.holes_tool = null; return; }
+      var inches = parseLength(text);
+      if (inches && inches > 0) { state.holes_tool = inches; }
+      else { alert('Could not parse "' + text + '" as a length. Use e.g. 0.125" or 3mm.'); this.value = ''; state.holes_tool = null; }
+    });
     $('#f-material').addEventListener('change', function () { if (state.mode !== 'tubing') state.material = this.value; });
     bindLengthField($('#f-tube-height'),
       function () { return state.tubeHeight_text; },
@@ -519,6 +631,8 @@
       var msel = $('#f-material'); if (msel) state.material = msel.value;
     }
     var tf = $('#tube-fields'); if (tf) tf.hidden = !isTube;
+    // Two-bit jobs ride the multi-part (2D) pipeline only.
+    var hb = $('#holes-bit-field'); if (hb) hb.style.display = (state.mode === '2d') ? '' : 'none';
     renderStepbar();
     updatePartsModeNote();
   }
@@ -984,6 +1098,445 @@
     $('#gen-status').textContent = '';
   }
 
+  /* ------------------------------------------------------ tabs & fixtures */
+  // The canvas shows the parts with the tab layout the SERVER computes (via
+  // /job-tab-preview, the same code path that places tabs at generation time), so
+  // the preview is exactly what gets cut. Edits update part-local overrides and
+  // re-request the layout, debounced.
+  var tabsView = { scale: 1, wcx: 0, wcy: 0, ccx: 0, ccy: 0 };
+  var tabsUi = { mode: 'edit', pending: null, timer: null, seq: 0, preview: null };
+
+  function tabsRefit() {
+    var canvas = $('#tabs-canvas');
+    if (!canvas) return;
+    var bb = combinedBBox();
+    var w = bb ? Math.max(bb.w, 1) : 10, h = bb ? Math.max(bb.h, 1) : 10;
+    tabsView.wcx = bb ? (bb.minX + bb.maxX) / 2 : 0;
+    tabsView.wcy = bb ? (bb.minY + bb.maxY) / 2 : 0;
+    tabsView.ccx = canvas.width / 2;
+    tabsView.ccy = canvas.height / 2;
+    tabsView.scale = Math.min(canvas.width / w, canvas.height / h) * 0.82;
+  }
+  function tabsW2C(x, y) {
+    return [tabsView.ccx + (x - tabsView.wcx) * tabsView.scale,
+            tabsView.ccy - (y - tabsView.wcy) * tabsView.scale];
+  }
+  function tabsC2W(cx, cy) {
+    return [tabsView.wcx + (cx - tabsView.ccx) / tabsView.scale,
+            tabsView.wcy - (cy - tabsView.ccy) / tabsView.scale];
+  }
+
+  function selectedTabPart() {
+    var sel = selectedParts();
+    return sel.length === 1 ? sel[0] : null;
+  }
+
+  function partLayout(p) {
+    if (!tabsUi.preview) return null;
+    var idx = state.parts.indexOf(p);
+    var entry = tabsUi.preview[idx];
+    return entry ? entry.layout : null;
+  }
+
+  function requestTabPreview() {
+    if (state.mode !== '2d' || !state.parts.length) return;
+    var mySeq = ++tabsUi.seq;
+    $('#tabs-status').textContent = 'Computing tab layout…';
+    var bb = combinedBBox() || { minX: 0, minY: 0, w: 0, h: 0 };
+    var fd = new FormData();
+    var job = {
+      material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
+      holes_tool_diameter: state.holes_tool,
+      thickness: state.thickness, tab_spacing: state.tab_spacing, parts: [],
+    };
+    state.parts.forEach(function (p, i) {
+      var pl = placement(p);
+      var ov = tabsPayloadFor(p, [bb.minX, bb.minY]);
+      job.parts.push({
+        file_index: i, name: p.name,
+        place_x: pl.x - bb.minX, place_y: pl.y - bb.minY,
+        rotation: p.rotation, mirror: !!p.flipped,
+        tabs: ov.tabs, fixtures: ov.fixtures, pocket_depths: ov.pocket_depths,
+      });
+      fd.append('file_' + i, p.file, p.name + '.dxf');
+    });
+    fd.append('job', JSON.stringify(job));
+    fetch('/job-tab-preview', { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (mySeq !== tabsUi.seq) return;   // a newer request superseded this one
+        if (!j.success) {
+          $('#tabs-status').textContent = '';
+          $('#tabs-errors').textContent = (j.part_errors || []).map(function (e) {
+            return (e.name || 'part') + ': ' + e.error;
+          }).join('\n') || j.error || 'Tab preview failed';
+          return;
+        }
+        tabsUi.preview = j.parts;
+        var warnings = [];
+        j.parts.forEach(function (pt) {
+          ((pt.layout && pt.layout.warnings) || []).forEach(function (w) {
+            warnings.push(pt.name + ': ' + w);
+          });
+        });
+        $('#tabs-errors').textContent = warnings.join('\n');
+        $('#tabs-status').textContent = '';
+        drawTabs();
+        updateTabsToolbar();
+      })
+      .catch(function (e) {
+        if (mySeq !== tabsUi.seq) return;
+        $('#tabs-status').textContent = '';
+        $('#tabs-errors').textContent = 'Tab preview failed: ' + e;
+      });
+  }
+  function scheduleTabPreview() {
+    if (tabsUi.timer) clearTimeout(tabsUi.timer);
+    tabsUi.timer = setTimeout(function () { tabsUi.timer = null; requestTabPreview(); }, 250);
+    drawTabs();   // redraw immediately with local state (markers refresh on response)
+  }
+
+  function drawTabs() {
+    var canvas = $('#tabs-canvas');
+    if (!canvas || state.step !== 'tabs') return;
+    var ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    var col = {
+      ink: cssVar('--ink') || '#e6edf3',
+      muted: cssVar('--muted') || '#9aa7b4',
+      danger: cssVar('--danger') || '#f85149',
+      accent: cssVar('--accent') || '#2f81f7',
+      ok: cssVar('--ok') || '#3fb950',
+      warn: '#d29922',
+    };
+    var bb = combinedBBox();
+    var bbMin = bb ? [bb.minX, bb.minY] : [0, 0];
+
+    // Stock outline (context, muted).
+    if (bb) {
+      var a = tabsW2C(bb.minX, bb.minY), c = tabsW2C(bb.maxX, bb.maxY);
+      ctx.save();
+      ctx.setLineDash([5, 4]); ctx.strokeStyle = col.muted; ctx.lineWidth = 1;
+      ctx.strokeRect(Math.min(a[0], c[0]), Math.min(a[1], c[1]), Math.abs(c[0] - a[0]), Math.abs(c[1] - a[1]));
+      ctx.restore();
+    }
+
+    state.parts.forEach(function (p) {
+      var pl = placement(p), s = pl.shape;
+      var selected = isSelected(p.id);
+      ctx.beginPath();
+      s.pts.forEach(function (pt, i) {
+        var pc = tabsW2C(pl.x + pt[0], pl.y + pt[1]);
+        if (i) ctx.lineTo(pc[0], pc[1]); else ctx.moveTo(pc[0], pc[1]);
+      });
+      ctx.closePath();
+      ctx.fillStyle = selected ? 'rgba(47,129,247,0.10)' : 'rgba(154,167,180,0.06)';
+      ctx.fill();
+      ctx.strokeStyle = selected ? col.accent : col.muted;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      s.holes.forEach(function (h) {
+        var hc = tabsW2C(pl.x + h.cx, pl.y + h.cy);
+        ctx.beginPath(); ctx.arc(hc[0], hc[1], Math.max(1.5, h.r * tabsView.scale), 0, 7);
+        ctx.strokeStyle = col.muted; ctx.stroke();
+      });
+      (s.inner || []).forEach(function (ring) {
+        ctx.beginPath();
+        ring.forEach(function (pt, i) {
+          var rc = tabsW2C(pl.x + pt[0], pl.y + pt[1]);
+          if (i) ctx.lineTo(rc[0], rc[1]); else ctx.moveTo(rc[0], rc[1]);
+        });
+        ctx.closePath(); ctx.strokeStyle = col.muted; ctx.lineWidth = 1; ctx.stroke();
+      });
+      var lc = tabsW2C(pl.x, pl.y + pl.h);
+      ctx.fillStyle = col.ink; ctx.font = '11px sans-serif';
+      ctx.fillText(p.name, lc[0] + 3, lc[1] + 12);
+
+      var layout = partLayout(p);
+      if (layout) {
+        function drawPath(pts, stroke, width, dash) {
+          if (!pts || pts.length < 2) return;
+          ctx.save();
+          if (dash) ctx.setLineDash(dash);
+          ctx.strokeStyle = stroke; ctx.lineWidth = width;
+          ctx.beginPath();
+          pts.forEach(function (pt, i) {
+            var pc = tabsW2C(pt[0] + bbMin[0], pt[1] + bbMin[1]);
+            if (i) ctx.lineTo(pc[0], pc[1]); else ctx.moveTo(pc[0], pc[1]);
+          });
+          ctx.stroke();
+          ctx.restore();
+        }
+        // Excluded spans (thick red) and the lead-in ramp (dashed orange).
+        (layout.excluded || []).forEach(function (span) { drawPath(span, col.danger, 4); });
+        drawPath(layout.ramp, col.warn, 2, [4, 3]);
+        // Tabs: filled squares on the cut path.
+        (layout.tabs || []).forEach(function (t) {
+          var tc = tabsW2C(t.x + bbMin[0], t.y + bbMin[1]);
+          ctx.fillStyle = col.ok;
+          ctx.fillRect(tc[0] - 4, tc[1] - 4, 8, 8);
+          ctx.strokeStyle = col.ink; ctx.lineWidth = 1;
+          ctx.strokeRect(tc[0] - 4, tc[1] - 4, 8, 8);
+        });
+        if (layout.enabled === false) {
+          var cc = tabsW2C(pl.x + pl.w / 2, pl.y + pl.h / 2);
+          ctx.fillStyle = col.warn; ctx.font = '11px sans-serif';
+          ctx.fillText('tabs off', cc[0] - 20, cc[1]);
+        }
+      }
+
+      // Fixture screws (part-local points).
+      (p.fixtures || []).forEach(function (fp) {
+        var sPt = localToSheet(p, fp[0], fp[1]);
+        var fc = tabsW2C(sPt[0], sPt[1]);
+        ctx.strokeStyle = col.accent; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(fc[0], fc[1], 6, 0, 7); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(fc[0] - 4, fc[1]); ctx.lineTo(fc[0] + 4, fc[1]);
+        ctx.moveTo(fc[0], fc[1] - 4); ctx.lineTo(fc[0], fc[1] + 4);
+        ctx.stroke();
+      });
+
+      // Partial-depth pockets: diamond marker + the depth, at the clicked point.
+      (p.pocketDepths || []).forEach(function (o) {
+        var dPt = localToSheet(p, o.pt[0], o.pt[1]);
+        var dc = tabsW2C(dPt[0], dPt[1]);
+        ctx.fillStyle = col.warn;
+        ctx.beginPath();
+        ctx.moveTo(dc[0], dc[1] - 5); ctx.lineTo(dc[0] + 5, dc[1]);
+        ctx.lineTo(dc[0], dc[1] + 5); ctx.lineTo(dc[0] - 5, dc[1]);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = col.ink; ctx.font = '11px sans-serif';
+        ctx.fillText(o.depth + '" deep', dc[0] + 7, dc[1] + 4);
+      });
+    });
+
+    // Pending exclusion first click.
+    if (tabsUi.pending) {
+      var pp = state.parts.filter(function (q) { return q.id === tabsUi.pending.partId; })[0];
+      if (pp) {
+        var sp = localToSheet(pp, tabsUi.pending.pt[0], tabsUi.pending.pt[1]);
+        var pc2 = tabsW2C(sp[0], sp[1]);
+        ctx.strokeStyle = col.danger; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(pc2[0] - 5, pc2[1] - 5); ctx.lineTo(pc2[0] + 5, pc2[1] + 5);
+        ctx.moveTo(pc2[0] - 5, pc2[1] + 5); ctx.lineTo(pc2[0] + 5, pc2[1] - 5);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function updateTabsToolbar() {
+    var p = selectedTabPart();
+    var layout = p ? partLayout(p) : null;
+    var cb = $('#tabs-enabled');
+    var reset = $('#btn-tabs-reset');
+    if (cb) {
+      cb.disabled = !p;
+      cb.checked = layout ? !!layout.enabled : true;
+    }
+    if (reset) reset.disabled = !p || (!p.tabsOv && !(p.fixtures || []).length &&
+                                       !(p.pocketDepths || []).length);
+    $all('#tabs-toolbar .mode-btn').forEach(function (b) {
+      b.classList.toggle('active', b.id === 'tabmode-' + tabsUi.mode);
+    });
+  }
+
+  // Distance (in canvas px) from a canvas point to a part's placed outline.
+  function outlineDistPx(p, cx, cy) {
+    var poly = placedPolygon(p);
+    var w = tabsC2W(cx, cy);
+    var best = Infinity;
+    for (var i = 0; i < poly.length; i++) {
+      var a = poly[i], b = poly[(i + 1) % poly.length];
+      var d = segPointDist(w[0], w[1], a[0], a[1], b[0], b[1]);
+      if (d < best) best = d;
+    }
+    return best * tabsView.scale;
+  }
+
+  function bindTabs() {
+    var canvas = $('#tabs-canvas');
+    if (!canvas) return;
+
+    ['edit', 'exclude', 'fixture', 'depth'].forEach(function (m) {
+      var b = $('#tabmode-' + m);
+      if (b) b.addEventListener('click', function () {
+        tabsUi.mode = m; tabsUi.pending = null;
+        $('#tabs-status').textContent =
+          m === 'exclude' ? 'Click two points on a part outline; tabs will avoid the shorter stretch between them.' :
+          m === 'depth' ? 'Click inside a pocket to set a partial depth (blank or 0 = cut through).' : '';
+        updateTabsToolbar(); drawTabs();
+      });
+    });
+
+    var cb = $('#tabs-enabled');
+    if (cb) cb.addEventListener('change', function () {
+      var p = selectedTabPart();
+      if (!p) return;
+      tabOv(p).enabled = cb.checked;
+      scheduleTabPreview();
+    });
+
+    var reset = $('#btn-tabs-reset');
+    if (reset) reset.addEventListener('click', function () {
+      var p = selectedTabPart();
+      if (!p) return;
+      p.tabsOv = null;
+      p.fixtures = [];
+      p.pocketDepths = [];
+      tabsUi.pending = null;
+      $('#tabs-status').textContent = p.name + ' reset: automatic tabs, no screws, all pockets cut through.';
+      updateTabsToolbar();
+      scheduleTabPreview();
+    });
+
+    canvas.addEventListener('mousedown', function (ev) {
+      var rect = canvas.getBoundingClientRect();
+      var cx = (ev.clientX - rect.left) * (canvas.width / rect.width);
+      var cy = (ev.clientY - rect.top) * (canvas.height / rect.height);
+      var w = tabsC2W(cx, cy);
+      var tolW = 10 / tabsView.scale;   // ~10px in world units
+
+      // Pick the part: inside its polygon, or nearest outline within tolerance.
+      var part = null, bestD = Infinity;
+      state.parts.forEach(function (p) {
+        var poly = placedPolygon(p);
+        var d = pointInPoly(w, poly) ? 0 : outlineDistPx(p, cx, cy) / tabsView.scale;
+        if (d < bestD) { bestD = d; part = p; }
+      });
+      if (!part || bestD > tolW * 2) { drawTabs(); return; }
+      if (!isSelected(part.id)) {
+        state.selectedIds = [part.id];
+        tabsUi.pending = null;
+      }
+
+      var bb = combinedBBox() || { minX: 0, minY: 0 };
+      var layout = partLayout(part);
+
+      if (tabsUi.mode === 'fixture') {
+        // Toggle a screw on the nearest hole (or remove a nearby existing screw).
+        var local = sheetToLocal(part, w[0], w[1]);
+        var fixtures = part.fixtures || (part.fixtures = []);
+        for (var fi = 0; fi < fixtures.length; fi++) {
+          var fs = localToSheet(part, fixtures[fi][0], fixtures[fi][1]);
+          if (Math.hypot(fs[0] - w[0], fs[1] - w[1]) < tolW) {
+            fixtures.splice(fi, 1);
+            updateTabsToolbar(); scheduleTabPreview(); return;
+          }
+        }
+        var hole = null, hBest = Infinity;
+        (part.holes || []).forEach(function (h) {
+          var d = Math.hypot(h.cx - local[0], h.cy - local[1]);
+          if (d < hBest) { hBest = d; hole = h; }
+        });
+        if (hole && hBest < Math.max(hole.r + tolW, tolW)) {
+          fixtures.push([hole.cx, hole.cy]);
+          updateTabsToolbar(); scheduleTabPreview();
+        } else {
+          $('#tabs-status').textContent = 'Click a hole to mark a fixture screw.';
+          drawTabs();
+        }
+        return;
+      }
+
+      if (tabsUi.mode === 'depth') {
+        // Set/adjust a partial depth on the clicked pocket (an inner ring).
+        var localD = sheetToLocal(part, w[0], w[1]);
+        var ring = null;
+        (part.inner || []).forEach(function (r2) { if (!ring && pointInPoly(localD, r2)) ring = r2; });
+        if (!ring) {
+          $('#tabs-status').textContent = 'Click inside a pocket (an internal cutout) to set its depth.';
+          drawTabs(); return;
+        }
+        var depths = part.pocketDepths || (part.pocketDepths = []);
+        var existing = null;
+        depths.forEach(function (o) { if (!existing && pointInPoly(o.pt, ring)) existing = o; });
+        var answer = window.prompt(
+          'Pocket depth in inches from the material top (blank or 0 = cut through):',
+          existing ? String(existing.depth) : '');
+        if (answer === null) { drawTabs(); return; }   // cancelled
+        var depth = parseFloat(answer);
+        if (!answer.trim() || !isFinite(depth) || depth <= 0) {
+          part.pocketDepths = depths.filter(function (o) { return o !== existing; });
+          $('#tabs-status').textContent = 'Pocket set to cut through.';
+        } else if (depth >= state.thickness) {
+          part.pocketDepths = depths.filter(function (o) { return o !== existing; });
+          $('#tabs-status').textContent = 'Depth >= material thickness - pocket cuts through.';
+        } else {
+          if (existing) { existing.pt = localD; existing.depth = depth; }
+          else depths.push({ pt: localD, depth: depth });
+          $('#tabs-status').textContent = 'Pocket depth set to ' + depth + '" from the top.';
+        }
+        updateTabsToolbar(); scheduleTabPreview();
+        return;
+      }
+
+      if (tabsUi.mode === 'exclude') {
+        var ov = tabOv(part);
+        if (ov.positions != null) {
+          $('#tabs-status').textContent = part.name + ' has custom tabs - Reset to auto to use exclusion regions.';
+          drawTabs(); return;
+        }
+        if (outlineDistPx(part, cx, cy) > 12) {
+          $('#tabs-status').textContent = 'Click on the part outline.';
+          drawTabs(); return;
+        }
+        var localPt = sheetToLocal(part, w[0], w[1]);
+        if (tabsUi.pending && tabsUi.pending.partId === part.id) {
+          ov.exclusions.push([tabsUi.pending.pt, localPt]);
+          tabsUi.pending = null;
+          $('#tabs-status').textContent = 'Region excluded. Click two more points to exclude another, or switch modes.';
+          updateTabsToolbar(); scheduleTabPreview();
+        } else {
+          tabsUi.pending = { partId: part.id, pt: localPt };
+          $('#tabs-status').textContent = 'Now click the second point of the region to exclude.';
+          drawTabs();
+        }
+        return;
+      }
+
+      // Edit mode: remove the clicked tab, or add one on the outline.
+      var ov2 = tabOv(part);
+      function seedFromLayout() {
+        if (ov2.positions == null) {
+          ov2.positions = ((layout && layout.tabs) || []).map(function (t) {
+            return sheetToLocal(part, t.x + bb.minX, t.y + bb.minY);
+          });
+        }
+      }
+      // Nearest existing tab marker?
+      var hit = -1, hitBest = Infinity;
+      ((layout && layout.tabs) || []).forEach(function (t, ti) {
+        var d = Math.hypot(t.x + bb.minX - w[0], t.y + bb.minY - w[1]);
+        if (d < hitBest) { hitBest = d; hit = ti; }
+      });
+      if (hit >= 0 && hitBest < tolW) {
+        seedFromLayout();
+        // Remove the seeded position nearest the clicked marker.
+        var target = (layout.tabs[hit]);
+        var ri = -1, rBest = Infinity;
+        ov2.positions.forEach(function (pos, pi) {
+          var s2 = localToSheet(part, pos[0], pos[1]);
+          var d2 = Math.hypot(s2[0] - (target.x + bb.minX), s2[1] - (target.y + bb.minY));
+          if (d2 < rBest) { rBest = d2; ri = pi; }
+        });
+        if (ri >= 0) ov2.positions.splice(ri, 1);
+        $('#tabs-status').textContent = 'Tab removed.';
+        updateTabsToolbar(); scheduleTabPreview();
+        return;
+      }
+      if (outlineDistPx(part, cx, cy) <= 12) {
+        seedFromLayout();
+        ov2.positions.push(sheetToLocal(part, w[0], w[1]));
+        $('#tabs-status').textContent = 'Tab added.';
+        updateTabsToolbar(); scheduleTabPreview();
+        return;
+      }
+      updateTabsToolbar(); drawTabs();
+    });
+  }
+
   function generate() {
     $('#preview-errors').textContent = '';
     $('#gen-status').textContent = 'Generating…';
@@ -1055,16 +1608,20 @@
     var bb = combinedBBox() || { minX: 0, minY: 0, w: 0, h: 0 };
     var job = {
       material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
+      holes_tool_diameter: state.holes_tool,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
       stock: { width: bb.w, height: bb.h },
+      machine_safety: collectMachineSafety(),
       name: jobFilename(), parts: [],
     };
     state.parts.forEach(function (p, i) {
       var pl = placement(p);
+      var ov = tabsPayloadFor(p, [bb.minX, bb.minY]);
       job.parts.push({
         file_index: i, name: p.name,
         place_x: pl.x - bb.minX, place_y: pl.y - bb.minY,
         rotation: p.rotation, mirror: !!p.flipped,
+        tabs: ov.tabs, fixtures: ov.fixtures, pocket_depths: ov.pocket_depths,
       });
       fd.append('file_' + i, p.file, p.name + '.dxf');
     });
@@ -1112,6 +1669,10 @@
   function showResult(resp) {
     $('#gen-status').textContent = '';
     $('#preview-result').hidden = false;
+    // Non-blocking generation warnings (e.g. a part left with fewer than 3 tabs).
+    if (resp.warnings && resp.warnings.length) {
+      $('#preview-errors').textContent = resp.warnings.map(function (w) { return '⚠ ' + w; }).join('\n');
+    }
     var t = resp.cycle_time ? ('Estimated cycle time: ' + resp.cycle_time) : '';
     var n;
     if (state.mode === 'tubing') { n = state.parts.length + ' face' + (state.parts.length === 1 ? '' : 's'); }
@@ -1331,8 +1892,10 @@
     // (multi-layer) export instead of a flat one when the user picked 2.5D.
     window.PenguinCAM.getMode = function () { return state.mode; };
     bindSetup();
+    bindMachineSafety();
     bindParts();
     bindLayout();
+    bindTabs();
     bindNav();
     bindFinalAction();
     bindConnect();
