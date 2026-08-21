@@ -9,6 +9,7 @@ Generates G-code from DXF files with predefined operations for:
 
 # Standard library
 import argparse
+import contextlib
 import datetime
 import json
 import math
@@ -183,6 +184,19 @@ class FRCPostProcessor:
         self.tab_exclusions = []           # [((ax,ay),(bx,by)), ...] job-space point pairs
         self.tab_positions = None          # None = auto; [(x,y), ...] = custom tab centers
         self.tab_warnings = []             # human-readable tab placement warnings
+
+        # Optional second bit for circular holes (wizard "Holes bit"). When set and
+        # different from the main tool, hole classification and the cleared-hole
+        # toolpaths use it, and a mandatory bit-change pause (with Z re-zero
+        # instructions) separates the holes phase from everything cut with the main
+        # bit. None = one bit for the whole job (historical behavior).
+        self.holes_tool_diameter = None
+
+        # Per-pocket partial-depth overrides from the wizard: [((x, y), depth), ...]
+        # where (x, y) is a job-space point inside the pocket and depth is inches
+        # from the material top. Overridden pockets are fully cleared to that Z
+        # (flat bottom) instead of cut through.
+        self.pocket_depth_overrides = []
 
         # Tube facing parameters
         self.tube_facing_offset = 0.0625  # Hole offset to align with faced surface at Y=+1/16" (inches)
@@ -999,22 +1013,27 @@ class FRCPostProcessor:
         return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
 
     def classify_holes(self):
-        """Classify holes by diameter"""
+        """Classify holes by diameter.
+
+        Uses the HOLES bit when one is configured (set_holes_tool) - a smaller
+        dedicated bit makes smaller holes millable than the main tool would."""
         # Classify all circles as holes (apply size check)
         self.holes = []
+        holes_tool = self._holes_tool()
+        holes_min_millable = holes_tool * self.config.min_millable_hole_multiplier
 
         for circle in self.circles:
             diameter = circle['diameter']
             center = circle['center']
 
-            # Check if hole is too small to mill with this tool
-            if diameter < self.tool_diameter:
-                error_msg = f"Hole at ({center[0]:.3f}, {center[1]:.3f}) has diameter {diameter:.3f}\" which is too small for {self.tool_diameter:.3f}\" tool"
+            # Check if hole is too small to mill with the bit that cuts holes
+            if diameter < holes_tool:
+                error_msg = f"Hole at ({center[0]:.3f}, {center[1]:.3f}) has diameter {diameter:.3f}\" which is too small for {holes_tool:.3f}\" tool"
                 self._add_error(error_msg)
                 continue
 
             # Determine machining strategy based on hole size
-            if diameter < self.min_millable_hole:
+            if diameter < holes_min_millable:
                 # Hole is larger than tool but too small to helical entry
                 # Use peck drilling to get down, then spiral clear at bottom
                 strategy = 'peck+spiral'
@@ -1363,20 +1382,31 @@ class FRCPostProcessor:
                     reason = "(partial depth)" if not is_through_cut else ""
                     gcode.append(f"(Hole {i} - {diameter:.3f}\" diameter, {hole_area:.3f} sq in - {strategy} {reason})")
 
-            # Process cleared holes first
+            # Process cleared holes first - with the HOLES bit when one is configured
+            # (helix radii, spiral stepover, and peck decisions all follow the bit
+            # that is actually in the spindle for this phase).
             if cleared_holes:
                 gcode.append("")
-                gcode.append("(--- Cleared holes ---)")
-                for i, hole, needs_peck in cleared_holes:
-                    center = hole['center']
-                    diameter = hole['diameter']
-                    gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
-                    gcode.append("")
+                if self._tool_change_needed():
+                    gcode.append(f"(--- Cleared holes - {self._holes_tool():.4f}\" holes bit ---)")
+                else:
+                    gcode.append("(--- Cleared holes ---)")
+                with self._tool_context(self._holes_tool()):
+                    for i, hole, needs_peck in cleared_holes:
+                        center = hole['center']
+                        diameter = hole['diameter']
+                        gcode.extend(self._generate_hole_gcode(center[0], center[1], diameter, needs_peck_drill=needs_peck))
+                        gcode.append("")
 
-        # ----- Fixturing boundary: cleared holes done, through-cuts about to start -----
+        # ----- Boundary: cleared holes done, main-bit cutting about to start -----
+        # Stops here for screw fixturing (pause_after_holes) and/or a bit change. For
+        # a bit change, the PERIMETER counts as work after the boundary too - a part
+        # with only holes and a perimeter still needs the bit swapped before the
+        # perimeter cut.
         middle = []
-        boundary_has_work_after = bool(contoured_holes or self.pockets)
-        if self.pause_after_holes and cleared_holes and boundary_has_work_after:
+        boundary_has_work_after = bool(contoured_holes or self.pockets or
+                                       (self._tool_change_needed() and getattr(self, 'perimeter', None)))
+        if self._boundary_needs_stop() and cleared_holes and boundary_has_work_after:
             if job_mode:
                 # assemble_job_gcode emits the shared pause between the collated HOLES
                 # and INTERIOR phases; the rest section re-enters from safe Z there, so
@@ -1384,12 +1414,8 @@ class FRCPostProcessor:
                 self._pending_clearance_rapid = True
             else:
                 middle = self._generate_pause_and_park_gcode(
-                    'PAUSE FOR FIXTURING',
-                    [
-                        'All circular holes complete',
-                        'Install screws through holes into sacrifice board',
-                        'Fixture part securely before contour cutting begins'
-                    ]
+                    self._boundary_pause_title(),
+                    self._boundary_pause_instructions(job_mode=False)
                 )
         rest_gcode = []
         gcode = rest_gcode   # everything from here on is after the boundary
@@ -1439,34 +1465,45 @@ class FRCPostProcessor:
             # Only contour through-cuts; partial-depth features must be fully cleared
             is_through_cut = self.cut_depth <= 0  # At or below Z=0 means cutting into sacrifice board
 
-            # Separate pockets into contoured and fully cleared based on size
+            # Separate pockets into contoured and fully cleared based on size. A pocket
+            # with a partial-depth override is ALWAYS fully cleared (it needs a flat
+            # bottom) and cuts to its own Z instead of through.
             contoured_pockets = []
-            cleared_pockets = []
+            cleared_pockets = []   # (i, pocket, area, cut_depth, partial_depth|None)
 
             for i, pocket in enumerate(self.pockets, 1):
                 pocket_poly = Polygon(pocket)
                 pocket_area = pocket_poly.area
+                pocket_cut_depth, partial = self._pocket_cut_depth(pocket)
+                pocket_through = is_through_cut and partial is None
 
                 # Calculate threshold area: contour_threshold × tool_diameter² / stepover
                 # Set contour_threshold to 0 to disable contouring entirely
                 threshold_area = (contour_threshold * self.tool_diameter**2 * self.stepover_percentage) if contour_threshold > 0 else float('inf')
 
                 # Only contour if it's a through-cut AND exceeds size threshold
-                if is_through_cut and pocket_area > threshold_area:
+                if pocket_through and pocket_area > threshold_area:
                     contoured_pockets.append((i, pocket, pocket_area))
                     gcode.append(f"(Pocket {i}: {pocket_area:.3f} sq in > {threshold_area:.3f} sq in threshold - will contour through-cut)")
                 else:
-                    cleared_pockets.append((i, pocket, pocket_area))
-                    reason = "- partial depth" if not is_through_cut else "- below threshold"
+                    cleared_pockets.append((i, pocket, pocket_area, pocket_cut_depth, partial))
+                    if partial is not None:
+                        reason = f"- partial depth {partial:.3f} in from top"
+                    else:
+                        reason = "- partial depth" if not is_through_cut else "- below threshold"
                     gcode.append(f"(Pocket {i}: {pocket_area:.3f} sq in - will fully clear {reason})")
 
             # Process fully cleared pockets first
             if cleared_pockets:
                 gcode.append("")
                 gcode.append("(--- Fully cleared pockets ---)")
-                for i, pocket, area in cleared_pockets:
-                    gcode.append(f"(Pocket {i} - {area:.3f} sq in)")
-                    gcode.extend(self._generate_pocket_gcode(pocket))
+                for i, pocket, area, pocket_cut_depth, partial in cleared_pockets:
+                    if partial is not None:
+                        gcode.append(f"(Pocket {i} - {area:.3f} sq in - partial depth {partial:.3f} in, bottom at Z{pocket_cut_depth:.4f})")
+                    else:
+                        gcode.append(f"(Pocket {i} - {area:.3f} sq in)")
+                    with self._cut_depth_context(pocket_cut_depth):
+                        gcode.extend(self._generate_pocket_gcode(pocket))
                     gcode.append("")
 
             # Process contoured pockets (with optional pause for fixturing)
@@ -1672,14 +1709,14 @@ class FRCPostProcessor:
         # _emit_phase), so the tool starts each phase up at safe height: flag the first
         # feature of each to rapid down to the clearance plane before its plunge feed.
 
-        # Phase A: interiors (holes + pockets), no per-feature pauses. When
-        # pause_after_holes is configured, the cleared-hole toolpath is returned as its
-        # own phase so the assembler can collate all parts' holes, pause once for screw
-        # fixturing, then run all parts' contours/pockets.
+        # Phase A: interiors (holes + pockets), no per-feature pauses. When the
+        # holes/contours boundary needs a stop (screw fixturing and/or a bit change),
+        # the cleared-hole toolpath is returned as its own phase so the assembler can
+        # collate all parts' holes, pause once, then run all parts' contours/pockets.
         self._pending_clearance_rapid = True
         holes_section, _middle, rest_section = self._generate_interior_sections(
             emit_contour_pauses=False, job_mode=True)
-        if self.pause_after_holes:
+        if self._boundary_needs_stop():
             holes_phase, interior = holes_section, rest_section
         else:
             holes_phase, interior = [], holes_section + rest_section
@@ -1895,6 +1932,8 @@ class FRCPostProcessor:
 
         gcode.append(f"(Material: {material_info})")
         gcode.append(f"(Tool: {self.tool_diameter}\" diam Flat End Mill)")
+        if self._tool_change_needed() and getattr(self, 'holes', None):
+            gcode.append(f"(Holes bit: {self.holes_tool_diameter}\" diam - START with this bit, change at the pause)")
         gcode.append(f"(Spindle: {self.spindle_speed} RPM)")
 
         if is_job and job_part_count is not None:
@@ -3809,6 +3848,110 @@ class FRCPostProcessor:
         if self.tab_override_enabled is not None:
             return bool(self.tab_override_enabled)
         return self.tabs_enabled
+
+    # ---- Two-bit jobs (holes bit + main bit) --------------------------------------
+
+    def set_holes_tool(self, diameter):
+        """Use a separate bit for circular holes (None/0/main-diameter = single bit).
+
+        Call BEFORE classify_holes so the too-small/peck decisions are made with the
+        bit that will actually cut the holes."""
+        if diameter is None:
+            self.holes_tool_diameter = None
+            return
+        diameter = float(diameter)
+        if diameter <= 0 or abs(diameter - self.tool_diameter) < 1e-9:
+            self.holes_tool_diameter = None
+        else:
+            self.holes_tool_diameter = diameter
+
+    def _tool_change_needed(self) -> bool:
+        return self.holes_tool_diameter is not None
+
+    def _holes_tool(self) -> float:
+        """The bit that cuts cleared circular holes."""
+        return self.holes_tool_diameter or self.tool_diameter
+
+    @contextlib.contextmanager
+    def _tool_context(self, diameter):
+        """Temporarily generate with a different bit (used for the holes phase)."""
+        saved = (self.tool_diameter, self.tool_radius, self.min_millable_hole)
+        self.tool_diameter = diameter
+        self.tool_radius = diameter / 2
+        self.min_millable_hole = diameter * self.config.min_millable_hole_multiplier
+        try:
+            yield
+        finally:
+            self.tool_diameter, self.tool_radius, self.min_millable_hole = saved
+
+    def _boundary_needs_stop(self) -> bool:
+        """Whether the holes/contours boundary must stop the machine: for screw
+        fixturing (pause_after_holes) and/or a bit change."""
+        return self.pause_after_holes or self._tool_change_needed()
+
+    def _boundary_pause_title(self) -> str:
+        if self._tool_change_needed() and self.pause_after_holes:
+            return 'PAUSE - CHANGE BIT + FIXTURING'
+        if self._tool_change_needed():
+            return 'PAUSE - CHANGE BIT'
+        return 'PAUSE FOR FIXTURING'
+
+    def _boundary_pause_instructions(self, job_mode: bool) -> List[str]:
+        """Operator instructions for the holes/contours boundary pause."""
+        lines = []
+        if self._tool_change_needed():
+            lines.append(f'CHANGE BIT: holes used the {self._holes_tool():.4f}" bit,'
+                         f' install the {self.tool_diameter:.4f}" bit now')
+            lines.append('RE-ZERO Z to the sacrifice board with the new bit')
+        if self.pause_after_holes:
+            if job_mode:
+                lines.append("All parts' circular holes complete")
+                lines.append('Install screws through holes into sacrifice board on ALL parts')
+                lines.append('Fixture every part securely before contour cutting begins')
+            else:
+                lines.append('All circular holes complete')
+                lines.append('Install screws through holes into sacrifice board')
+                lines.append('Fixture part securely before contour cutting begins')
+        return lines
+
+    # ---- Per-pocket partial depths -------------------------------------------------
+
+    def set_pocket_depths(self, overrides):
+        """Per-pocket partial-depth overrides: [((x, y), depth_inches_from_top), ...].
+        The point identifies the pocket (any point inside it, job space)."""
+        clean = []
+        for pt, depth in (overrides or []):
+            try:
+                d = float(depth)
+                if d > 0:
+                    clean.append(((float(pt[0]), float(pt[1])), d))
+            except (TypeError, ValueError):
+                continue
+        self.pocket_depth_overrides = clean
+
+    def _pocket_cut_depth(self, pocket_points):
+        """The Z this pocket cuts to: the through-cut depth (self.cut_depth) unless a
+        partial-depth override point lands inside it. Depths at or beyond the material
+        thickness mean 'through' and use the normal through-cut depth."""
+        if not self.pocket_depth_overrides:
+            return self.cut_depth, None
+        poly = Polygon(pocket_points)
+        for (px, py), depth in self.pocket_depth_overrides:
+            if poly.contains(Point(px, py)):
+                if depth >= self.material_thickness - 1e-6:
+                    return self.cut_depth, None      # full depth requested = through
+                return self.material_top - depth, depth
+        return self.cut_depth, None
+
+    @contextlib.contextmanager
+    def _cut_depth_context(self, cut_depth):
+        """Temporarily generate to a different target Z (partial-depth pockets)."""
+        saved = self.cut_depth
+        self.cut_depth = cut_depth
+        try:
+            yield
+        finally:
+            self.cut_depth = saved
 
     @staticmethod
     def _subtract_intervals(base, cuts):
@@ -5895,14 +6038,15 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     fixture_notes_emitted = False
     emitted_holes = _emit_phase("PHASE: HOLES", 'holes')
     has_more_interior = any(pj.get('interior') for pj in part_jobs)
-    if header_pp.pause_after_holes and emitted_holes and has_more_interior:
+    job_has_perimeters = any(pj.get('perimeter') for pj in part_jobs)
+    # A bit change must also stop before perimeter-only main-bit work (a job of
+    # holes + perimeters with no pockets still needs the bit swapped).
+    boundary_work_after = has_more_interior or (header_pp._tool_change_needed()
+                                                and job_has_perimeters)
+    if header_pp._boundary_needs_stop() and emitted_holes and boundary_work_after:
         gcode.extend(header_pp._generate_pause_and_park_gcode(
-            'PAUSE FOR FIXTURING',
-            [
-                "All parts' circular holes complete",
-                'Install screws through holes into sacrifice board on ALL parts',
-                'Fixture every part securely before contour cutting begins'
-            ] + fixture_notes
+            header_pp._boundary_pause_title(),
+            header_pp._boundary_pause_instructions(job_mode=True) + fixture_notes
         ))
         fixture_notes_emitted = bool(fixture_notes)
 

@@ -28,6 +28,7 @@
     material: 'plywood',
     tool_diameter: parseFloat(CFG.defaultTool) || 0.157,
     tool_diameter_text: CFG.defaultToolText || '4mm',  // user's raw input, shown verbatim (e.g. "4mm")
+    holes_tool: null,     // optional dedicated bit for circular holes (inches), null = same bit
     thickness: 0.25,
     thickness_text: '0.25"',
     tab_spacing: 6.0,
@@ -224,6 +225,9 @@
         positions: (ov.positions == null) ? null : ov.positions.map(lj),
       },
       fixtures: (p.fixtures || []).map(lj),
+      pocket_depths: (p.pocketDepths || []).map(function (o) {
+        return { at: lj(o.pt), depth: o.depth };
+      }),
     };
   }
 
@@ -543,6 +547,16 @@
     bindLengthField($('#f-thickness'),
       function () { return state.thickness_text; },
       function (inches, text) { state.thickness = inches; state.thickness_text = text; });
+    // Holes bit: blank means "one bit for everything", so bind manually rather than
+    // through bindLengthField (which treats blank as invalid input).
+    var holesBit = $('#f-holes-bit');
+    if (holesBit) holesBit.addEventListener('change', function () {
+      var text = this.value.trim();
+      if (!text) { state.holes_tool = null; return; }
+      var inches = parseLength(text);
+      if (inches && inches > 0) { state.holes_tool = inches; }
+      else { alert('Could not parse "' + text + '" as a length. Use e.g. 0.125" or 3mm.'); this.value = ''; state.holes_tool = null; }
+    });
     $('#f-material').addEventListener('change', function () { if (state.mode !== 'tubing') state.material = this.value; });
     bindLengthField($('#f-tube-height'),
       function () { return state.tubeHeight_text; },
@@ -617,6 +631,8 @@
       var msel = $('#f-material'); if (msel) state.material = msel.value;
     }
     var tf = $('#tube-fields'); if (tf) tf.hidden = !isTube;
+    // Two-bit jobs ride the multi-part (2D) pipeline only.
+    var hb = $('#holes-bit-field'); if (hb) hb.style.display = (state.mode === '2d') ? '' : 'none';
     renderStepbar();
     updatePartsModeNote();
   }
@@ -1130,6 +1146,7 @@
     var fd = new FormData();
     var job = {
       material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
+      holes_tool_diameter: state.holes_tool,
       thickness: state.thickness, tab_spacing: state.tab_spacing, parts: [],
     };
     state.parts.forEach(function (p, i) {
@@ -1139,7 +1156,7 @@
         file_index: i, name: p.name,
         place_x: pl.x - bb.minX, place_y: pl.y - bb.minY,
         rotation: p.rotation, mirror: !!p.flipped,
-        tabs: ov.tabs, fixtures: ov.fixtures,
+        tabs: ov.tabs, fixtures: ov.fixtures, pocket_depths: ov.pocket_depths,
       });
       fd.append('file_' + i, p.file, p.name + '.dxf');
     });
@@ -1223,6 +1240,14 @@
         ctx.beginPath(); ctx.arc(hc[0], hc[1], Math.max(1.5, h.r * tabsView.scale), 0, 7);
         ctx.strokeStyle = col.muted; ctx.stroke();
       });
+      (s.inner || []).forEach(function (ring) {
+        ctx.beginPath();
+        ring.forEach(function (pt, i) {
+          var rc = tabsW2C(pl.x + pt[0], pl.y + pt[1]);
+          if (i) ctx.lineTo(rc[0], rc[1]); else ctx.moveTo(rc[0], rc[1]);
+        });
+        ctx.closePath(); ctx.strokeStyle = col.muted; ctx.lineWidth = 1; ctx.stroke();
+      });
       var lc = tabsW2C(pl.x, pl.y + pl.h);
       ctx.fillStyle = col.ink; ctx.font = '11px sans-serif';
       ctx.fillText(p.name, lc[0] + 3, lc[1] + 12);
@@ -1271,6 +1296,19 @@
         ctx.moveTo(fc[0], fc[1] - 4); ctx.lineTo(fc[0], fc[1] + 4);
         ctx.stroke();
       });
+
+      // Partial-depth pockets: diamond marker + the depth, at the clicked point.
+      (p.pocketDepths || []).forEach(function (o) {
+        var dPt = localToSheet(p, o.pt[0], o.pt[1]);
+        var dc = tabsW2C(dPt[0], dPt[1]);
+        ctx.fillStyle = col.warn;
+        ctx.beginPath();
+        ctx.moveTo(dc[0], dc[1] - 5); ctx.lineTo(dc[0] + 5, dc[1]);
+        ctx.lineTo(dc[0], dc[1] + 5); ctx.lineTo(dc[0] - 5, dc[1]);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = col.ink; ctx.font = '11px sans-serif';
+        ctx.fillText(o.depth + '" deep', dc[0] + 7, dc[1] + 4);
+      });
     });
 
     // Pending exclusion first click.
@@ -1297,7 +1335,8 @@
       cb.disabled = !p;
       cb.checked = layout ? !!layout.enabled : true;
     }
-    if (reset) reset.disabled = !p || (!p.tabsOv && !(p.fixtures || []).length);
+    if (reset) reset.disabled = !p || (!p.tabsOv && !(p.fixtures || []).length &&
+                                       !(p.pocketDepths || []).length);
     $all('#tabs-toolbar .mode-btn').forEach(function (b) {
       b.classList.toggle('active', b.id === 'tabmode-' + tabsUi.mode);
     });
@@ -1320,12 +1359,13 @@
     var canvas = $('#tabs-canvas');
     if (!canvas) return;
 
-    ['edit', 'exclude', 'fixture'].forEach(function (m) {
+    ['edit', 'exclude', 'fixture', 'depth'].forEach(function (m) {
       var b = $('#tabmode-' + m);
       if (b) b.addEventListener('click', function () {
         tabsUi.mode = m; tabsUi.pending = null;
-        $('#tabs-status').textContent = m === 'exclude' ?
-          'Click two points on a part outline; tabs will avoid the shorter stretch between them.' : '';
+        $('#tabs-status').textContent =
+          m === 'exclude' ? 'Click two points on a part outline; tabs will avoid the shorter stretch between them.' :
+          m === 'depth' ? 'Click inside a pocket to set a partial depth (blank or 0 = cut through).' : '';
         updateTabsToolbar(); drawTabs();
       });
     });
@@ -1344,8 +1384,9 @@
       if (!p) return;
       p.tabsOv = null;
       p.fixtures = [];
+      p.pocketDepths = [];
       tabsUi.pending = null;
-      $('#tabs-status').textContent = p.name + ' reset to automatic tabs.';
+      $('#tabs-status').textContent = p.name + ' reset: automatic tabs, no screws, all pockets cut through.';
       updateTabsToolbar();
       scheduleTabPreview();
     });
@@ -1396,6 +1437,38 @@
           $('#tabs-status').textContent = 'Click a hole to mark a fixture screw.';
           drawTabs();
         }
+        return;
+      }
+
+      if (tabsUi.mode === 'depth') {
+        // Set/adjust a partial depth on the clicked pocket (an inner ring).
+        var localD = sheetToLocal(part, w[0], w[1]);
+        var ring = null;
+        (part.inner || []).forEach(function (r2) { if (!ring && pointInPoly(localD, r2)) ring = r2; });
+        if (!ring) {
+          $('#tabs-status').textContent = 'Click inside a pocket (an internal cutout) to set its depth.';
+          drawTabs(); return;
+        }
+        var depths = part.pocketDepths || (part.pocketDepths = []);
+        var existing = null;
+        depths.forEach(function (o) { if (!existing && pointInPoly(o.pt, ring)) existing = o; });
+        var answer = window.prompt(
+          'Pocket depth in inches from the material top (blank or 0 = cut through):',
+          existing ? String(existing.depth) : '');
+        if (answer === null) { drawTabs(); return; }   // cancelled
+        var depth = parseFloat(answer);
+        if (!answer.trim() || !isFinite(depth) || depth <= 0) {
+          part.pocketDepths = depths.filter(function (o) { return o !== existing; });
+          $('#tabs-status').textContent = 'Pocket set to cut through.';
+        } else if (depth >= state.thickness) {
+          part.pocketDepths = depths.filter(function (o) { return o !== existing; });
+          $('#tabs-status').textContent = 'Depth >= material thickness - pocket cuts through.';
+        } else {
+          if (existing) { existing.pt = localD; existing.depth = depth; }
+          else depths.push({ pt: localD, depth: depth });
+          $('#tabs-status').textContent = 'Pocket depth set to ' + depth + '" from the top.';
+        }
+        updateTabsToolbar(); scheduleTabPreview();
         return;
       }
 
@@ -1535,6 +1608,7 @@
     var bb = combinedBBox() || { minX: 0, minY: 0, w: 0, h: 0 };
     var job = {
       material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
+      holes_tool_diameter: state.holes_tool,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
       stock: { width: bb.w, height: bb.h },
       machine_safety: collectMachineSafety(),
@@ -1547,7 +1621,7 @@
         file_index: i, name: p.name,
         place_x: pl.x - bb.minX, place_y: pl.y - bb.minY,
         rotation: p.rotation, mirror: !!p.flipped,
-        tabs: ov.tabs, fixtures: ov.fixtures,
+        tabs: ov.tabs, fixtures: ov.fixtures, pocket_depths: ov.pocket_depths,
       });
       fd.append('file_' + i, p.file, p.name + '.dxf');
     });

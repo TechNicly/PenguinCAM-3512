@@ -68,6 +68,13 @@
                            placeholder='e.g. 0.157" or 4mm' value="{{ default_tool_diameter_text }}">
                 </label>
 
+                <label class="field" id="holes-bit-field">
+                    <span>Holes bit (optional) - a smaller bit for circular holes; the program
+                          pauses to change bits and re-zero Z before contour cutting</span>
+                    <input type="text" id="f-holes-bit" inputmode="text" autocomplete="off" spellcheck="false"
+                           placeholder='blank = one bit for everything'>
+                </label>
+
                 <label class="field" id="material-field">
                     <span>Material</span>
                     <select id="f-material">
@@ -168,11 +175,12 @@
             <!-- ===== TABS & FIXTURES ===== -->
             <section class="step" data-step="tabs" hidden>
                 <h2>Tabs &amp; Fixtures</h2>
-                <p class="hint" id="tabs-hint">Green squares are holding tabs, exactly where they will be cut. Click a part to select it. In Edit mode: click a tab to remove it, click the outline to add one. In Exclude mode: click two points on the outline to keep tabs out of the shorter stretch between them. In Screws mode: click holes to mark fixture screws (listed in the pause message). The dashed orange span is the lead-in ramp.</p>
+                <p class="hint" id="tabs-hint">Green squares are holding tabs, exactly where they will be cut. Click a part to select it. In Edit mode: click a tab to remove it, click the outline to add one. In Exclude mode: click two points on the outline to keep tabs out of the shorter stretch between them. In Screws mode: click holes to mark fixture screws (listed in the pause message). In Depths mode: click a pocket to give it a partial depth instead of cutting through. The dashed orange span is the lead-in ramp.</p>
                 <div id="tabs-toolbar">
                     <button type="button" class="btn small mode-btn active" id="tabmode-edit">Edit tabs</button>
                     <button type="button" class="btn small mode-btn" id="tabmode-exclude">Exclude region</button>
                     <button type="button" class="btn small mode-btn" id="tabmode-fixture">Screws</button>
+                    <button type="button" class="btn small mode-btn" id="tabmode-depth">Depths</button>
                     <span class="spacer"></span>
                     <label class="hint" id="tabs-enabled-wrap"><input type="checkbox" id="tabs-enabled" checked> Tabs on this part</label>
                     <button type="button" class="btn small" id="btn-tabs-reset" disabled>Reset part to auto</button>

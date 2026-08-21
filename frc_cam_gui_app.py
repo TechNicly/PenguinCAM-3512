@@ -1035,8 +1035,35 @@ def _parse_fixture_points(part_spec):
     return points
 
 
+def _parse_pocket_depths(part_spec):
+    """Sanitize a part's `pocket_depths` list from the wizard's Depths mode:
+    [{'at': [x, y], 'depth': inches_from_top}, ...] in job space. Returns the
+    [((x, y), depth), ...] form set_pocket_depths expects; malformed entries drop."""
+    overrides = []
+    for entry in (part_spec.get('pocket_depths') or []):
+        try:
+            at = entry['at']
+            overrides.append(((float(at[0]), float(at[1])), float(entry['depth'])))
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+    return overrides
+
+
+def _parse_holes_tool(job):
+    """The optional dedicated holes bit for a job, as inches or None."""
+    raw = job.get('holes_tool_diameter')
+    if raw in (None, '', 0, '0'):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _load_job_parts(parts_spec, saved_paths, team_config, material, machine_id,
-                    tool_diameter, thickness, tab_spacing, user_name):
+                    tool_diameter, thickness, tab_spacing, user_name,
+                    holes_tool_diameter=None):
     """Load, place, and configure each part of a job (shared by /process-job and
     /job-tab-preview so the tab layout previewed is exactly the one that gets cut).
 
@@ -1063,6 +1090,9 @@ def _load_job_parts(parts_spec, saved_paths, team_config, material, machine_id,
         if user_name:
             pp.user_name = user_name
         pp.tab_spacing = tab_spacing
+        # The holes bit must be set BEFORE classify_holes: it decides which holes are
+        # millable and which get peck drilling.
+        pp.set_holes_tool(holes_tool_diameter)
         pp.load_dxf(saved_paths[fidx])
         pp.transform_coordinates('bottom-left', rotation,
                                  placement_offset=(place_x, place_y),
@@ -1072,6 +1102,7 @@ def _load_job_parts(parts_spec, saved_paths, team_config, material, machine_id,
 
         enabled, exclusions, positions = _parse_tab_overrides(part)
         pp.set_tab_overrides(enabled=enabled, exclusions=exclusions, positions=positions)
+        pp.set_pocket_depths(_parse_pocket_depths(part))
 
         bbox = pp.bounding_box()
         placed.append({'name': name, 'bbox': bbox, 'polygon': pp.placed_polygon()})
@@ -1162,7 +1193,8 @@ def process_job():
         # Pass 1: build + place each part; collect footprints for layout validation.
         prepared, placed, gen_errors = _load_job_parts(
             parts_spec, saved_paths, team_config, material, machine_id,
-            tool_diameter, thickness, tab_spacing, user_name)
+            tool_diameter, thickness, tab_spacing, user_name,
+            holes_tool_diameter=_parse_holes_tool(job))
 
         if gen_errors:
             return jsonify({'success': False, 'part_errors': gen_errors}), 400
@@ -1325,7 +1357,8 @@ def job_tab_preview():
         team_config = TeamConfig.from_dict(_team_config_data())
         prepared, _placed, gen_errors = _load_job_parts(
             parts_spec, saved_paths, team_config, material, machine_id,
-            tool_diameter, thickness, tab_spacing, user_name=None)
+            tool_diameter, thickness, tab_spacing, user_name=None,
+            holes_tool_diameter=_parse_holes_tool(job))
         if gen_errors:
             return jsonify({'success': False, 'part_errors': gen_errors}), 400
 
