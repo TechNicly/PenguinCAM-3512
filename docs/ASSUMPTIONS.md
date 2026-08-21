@@ -19,6 +19,15 @@ every controller supports:
 * **`park_position`** (machine-coordinate park) → emits `G53` machine moves. Leave it out
   for controllers that don't support `G53` (e.g. GRBL behaves unexpectedly). This is
   the ONLY thing that puts `G53` in the output.
+  **The values are HOMED machine coordinates in the controller's own convention** — on
+  most Mach3/GRBL machines home is 0 and all travel is NEGATIVE; a positive value on
+  such a machine drives through the physical stops. Configure `machine.soft_limits`
+  (e.g. `x: [-22.2, 0]`) and every park is validated against them: an out-of-range park
+  **fails generation** instead of emitting the move. Without soft limits, the program
+  header carries a warning and the park is echoed for the operator to verify against
+  the DRO. `machining.fixturing.park_during_pause: false` makes mid-job pauses raise
+  to safe Z and stop in place (no G53 during the job); the end-of-program park is
+  unaffected.
 * **`machine.coolant`** (`Air`/`Mist`/`Flood`) → emits `M7`/`M8`/`M9`. Leave it out (or set
   `None`) on controllers without coolant M-codes (stock GRBL rejects `M7` unless compiled
   with it).

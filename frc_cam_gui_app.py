@@ -497,6 +497,9 @@ def _app_template_context():
         'user_name': user_name,
         'team_name': team_name,
         'drive_enabled': drive_enabled,
+        'park_position': team_config.park_position,
+        'soft_limits': team_config.soft_limits,
+        'park_during_pause': team_config.park_during_pause,
         'default_tool_diameter': default_tool_diameter,
         'default_tool_diameter_text': default_tool_diameter_text,
         'machine_x_max': machine_x_max,
@@ -1164,6 +1167,24 @@ def process_job():
         if gen_errors:
             return jsonify({'success': False, 'part_errors': gen_errors}), 400
 
+        # Job-level machine-safety overrides from the wizard's Machine & safety panel
+        # (soft limits for validating the G53 park; pause-park behavior). Applied to
+        # every part's pp; absent fields keep the team-config defaults.
+        safety = job.get('machine_safety') or {}
+        soft_limits = {}
+        for axis, pair in (safety.get('soft_limits') or {}).items():
+            try:
+                if axis in ('x', 'y', 'z') and len(pair) == 2:
+                    lo, hi = float(pair[0]), float(pair[1])
+                    soft_limits[axis] = (min(lo, hi), max(lo, hi))
+            except (TypeError, ValueError):
+                continue
+        for item in prepared:
+            if soft_limits:
+                item['pp'].soft_limits = soft_limits
+            if 'park_during_pause' in safety:
+                item['pp'].park_during_pause = bool(safety['park_during_pause'])
+
         # Stock = the parts' combined bounding box (server-authoritative).
         boxes = [p['bbox'] for p in placed if p.get('bbox')]
         if boxes:
@@ -1191,6 +1212,9 @@ def process_job():
                 continue
             for w in item['pp'].tab_warnings:
                 job_warnings.append(f"{item['name']}: {w}")
+            for w in item['pp'].park_warnings:
+                if w not in job_warnings:   # park config is job-wide; report it once
+                    job_warnings.append(w)
             part_jobs.append({
                 'name': item['name'], 'place_x': item['place_x'],
                 'place_y': item['place_y'], 'rotation': item['rotation'],

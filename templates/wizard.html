@@ -102,6 +102,31 @@
                         <span>Machine the far end to length</span>
                     </label>
                 </div>
+
+                <!-- Machine & safety: optional soft limits and pause-park behavior.
+                     Collapsed by default - skipping it keeps the team-config defaults. -->
+                <details class="field" id="machine-safety">
+                    <summary>Machine &amp; safety (optional)</summary>
+                    <p class="hint">Soft limits are HOMED machine coordinates from your controller's
+                       machine-coordinate DRO. On most Mach3/GRBL machines home is 0 and all travel is
+                       <strong>negative</strong> (e.g. X from -22.2 to 0). When set, the park move is
+                       validated against them and generation fails instead of driving past the stops.
+                       Leave blank to keep the config defaults.</p>
+                    <div id="park-info" class="hint"></div>
+                    <label class="field inline" id="park-pause-wrap">
+                        <input type="checkbox" id="f-park-pause">
+                        <span>Drive to park position during mid-job pauses (uncheck to raise Z and stop in place)</span>
+                    </label>
+                    <div class="limits-grid">
+                        <span></span><span class="hint">min</span><span class="hint">max</span>
+                        <span>X</span>
+                        <input type="text" id="f-lim-xmin" placeholder="-22.2"><input type="text" id="f-lim-xmax" placeholder="0">
+                        <span>Y</span>
+                        <input type="text" id="f-lim-ymin" placeholder="-30.3"><input type="text" id="f-lim-ymax" placeholder="0">
+                        <span>Z</span>
+                        <input type="text" id="f-lim-zmin" placeholder="-3.3"><input type="text" id="f-lim-zmax" placeholder="0">
+                    </div>
+                </details>
             </section>
 
             <!-- ===== PARTS ===== -->
@@ -237,6 +262,9 @@
         defaultTool: {{ default_tool_diameter|tojson }},
         defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
         driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
+        park: {{ (park_position if park_position is defined else none)|tojson }},
+        softLimits: {{ (soft_limits if soft_limits is defined else none)|tojson }},
+        parkDuringPause: {{ (park_during_pause if park_during_pause is defined else true)|tojson }},
       };
     </script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>

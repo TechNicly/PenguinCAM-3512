@@ -195,6 +195,11 @@ class FRCPostProcessor:
         # portable across controllers.
         self.park_position = config.park_position  # (x, y, z) machine coords, or None
         self.safe_clearance_height = config.safe_clearance_height  # configured G54 ceiling, or None
+        # Machine-coordinate travel limits for validating G53 moves ({'x': (min, max),
+        # ...} or None) and whether mid-job pauses may drive to the park position.
+        self.soft_limits = config.soft_limits
+        self.park_during_pause = config.park_during_pause
+        self.park_warnings = []  # non-blocking park safety notices for the response
         # Work coordinate system for tube ops. 'G54' (default) = operator zeros G54 to the
         # tube per job (portable); an alternate fixed WCS (e.g. 'G55') is opt-in for a
         # permanently-fixtured jig so its zero persists alongside the flat-work G54 zero.
@@ -345,7 +350,11 @@ class FRCPostProcessor:
         # pass safe_z; otherwise the material-based work clearance is used.
         z = safe_z if safe_z is not None else self._safe_z()
         gcode.append(f'G0 Z{z:.4f}  ; Safe Z clearance')
-        gcode.extend(self._park_gcode('Park'))  # G53 park only if configured
+        # Mid-job parking is opt-out (machining.fixturing.park_during_pause): with it
+        # off, the pause raises to safe Z and stops in place - no G53 motion during
+        # the job. (And as always, no park_position -> no G53 at all.)
+        if self.park_during_pause:
+            gcode.extend(self._park_gcode('Park'))  # G53 park only if configured
         coolant_off = self._coolant_off_gcode()
         if coolant_off:
             gcode.append(coolant_off)
@@ -1517,6 +1526,10 @@ class FRCPostProcessor:
         Returns:
             PostProcessorResult with gcode string and stats
         """
+        # Park safety first: a bad G53 park physically crashes the machine, so an
+        # invalid one (per soft limits) must block generation entirely.
+        self.check_park_safety()
+
         # Check for validation errors first
         if self.errors:
             print(f"\n❌ Cannot generate G-code: {len(self.errors)} validation error(s) found")
@@ -1537,7 +1550,7 @@ class FRCPostProcessor:
 
         # Generate header (skipped for job-body mode; assemble_job_gcode adds one shared header)
         gcode = self._generate_gcode_header(timestamp, is_multilayer=False) if include_header_footer else []
-        warnings = []
+        warnings = list(self.park_warnings)
 
         # Interior features (holes + pockets). Extracted to a shared helper so the
         # multi-part job assembler can collate interiors across parts. In single-part
@@ -1639,6 +1652,10 @@ class FRCPostProcessor:
         Coordinates are already in absolute job space (transform_coordinates applied the
         placement offset), so phases from different parts can be freely interleaved.
         """
+        # Park safety first (see check_park_safety) - an invalid park must fail the
+        # part rather than emit a G53 that drives through the stops.
+        self.check_park_safety()
+
         # Fail fast on pre-existing validation errors (same guard as generate_gcode).
         if self.errors:
             return {'holes': [], 'interior': [], 'perimeter': [], 'tab_removal': [],
@@ -1721,6 +1738,47 @@ class FRCPostProcessor:
             f'G53 G0 Z{pz:.4f}  ; {comment}: raise to safe machine Z',
             f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
         ]
+
+    def check_park_safety(self):
+        """Validate the configured G53 park position before any G-code is emitted.
+
+        A park position is stated in HOMED machine coordinates - on most Mach3/GRBL
+        machines home is 0 and all valid travel is NEGATIVE, so a positive Y park on
+        such a machine drives the gantry through the physical stops, loses steps, and
+        corrupts position for the rest of the job (a real crash on the reference
+        machine motivated this check).
+
+        - With machine.soft_limits configured: an out-of-range park BLOCKS generation
+          (appends to self.errors).
+        - Without soft limits: the park cannot be validated, so a warning is recorded
+          on self.park_warnings for the UI and echoed into the program header.
+
+        Safe to call more than once per job (it deduplicates its own messages).
+        """
+        if not self.park_position:
+            return
+        px, py, pz = self.park_position
+        if self.soft_limits:
+            for axis, value in (('x', px), ('y', py), ('z', pz)):
+                pair = self.soft_limits.get(axis)
+                if pair is None:
+                    continue
+                lo, hi = pair
+                if value < lo - 1e-9 or value > hi + 1e-9:
+                    msg = (f"Park position {axis.upper()}{value:g} is outside the machine's "
+                           f"soft limits [{lo:g}, {hi:g}] (machine coordinates). The park "
+                           f"move would drive through the physical stops - fix "
+                           f"machine.park_position or machine.soft_limits in the config.")
+                    if msg not in self.errors:
+                        self._add_error(msg)
+        else:
+            msg = (f"Park position (machine X{px:g} Y{py:g} Z{pz:g}) is NOT validated: no "
+                   f"machine.soft_limits configured. Most Mach3/GRBL machines home to 0 "
+                   f"with NEGATIVE travel - if your DRO shows negative machine coordinates, "
+                   f"this park will crash the gantry into the stops. Jog to the desired "
+                   f"park spot, read the MACHINE coordinate DRO, and use those exact values.")
+            if msg not in self.park_warnings:
+                self.park_warnings.append(msg)
 
     def _tube_wcs_activate_gcode(self) -> str:
         """The work-coordinate-system line that opens a tube program. Default G54 (the
@@ -1812,6 +1870,19 @@ class FRCPostProcessor:
             gcode.append("(Coordinate system: G54)")
             gcode.append("(Plane: G17 - XY)")
             gcode.append("(Arc centers: Incremental - G91.1)")
+
+        # Disclose machine-coordinate motion up front: the operator can sanity-check
+        # the park against their DRO before pressing cycle start.
+        if self.park_position:
+            px, py, pz = self.park_position
+            gcode.append(f"(Park: G53 machine X{px:g} Y{py:g} Z{pz:g})")
+            if self.soft_limits:
+                lim = ', '.join(f"{a.upper()} {v[0]:g} to {v[1]:g}"
+                                for a, v in sorted(self.soft_limits.items()))
+                gcode.append(f"(Machine soft limits: {lim} - park validated)")
+            else:
+                gcode.append("(WARNING: park NOT validated - no machine soft_limits configured)")
+                gcode.append("(  Verify X/Y/Z above against your MACHINE coordinate DRO before running)")
 
         gcode.append("")
 
@@ -4772,6 +4843,12 @@ class FRCPostProcessor:
         Returns:
             PostProcessorResult with gcode string and stats
         """
+        # Park safety first: an invalid G53 park must fail generation, and an
+        # unvalidated one is surfaced as a warning (see check_park_safety).
+        self.check_park_safety()
+        if self.errors:
+            return PostProcessorResult(success=False, errors=self.errors.copy())
+
         # Parse tube dimensions
         tube_width, tube_height = self._parse_tube_size(tube_size)
 
@@ -4980,6 +5057,12 @@ class FRCPostProcessor:
         Returns:
             PostProcessorResult with gcode string and stats
         """
+        # Park safety first: an invalid G53 park must fail generation, and an
+        # unvalidated one is surfaced as a warning (see check_park_safety).
+        self.check_park_safety()
+        if self.errors:
+            return PostProcessorResult(success=False, errors=self.errors.copy())
+
         # Check for validation errors first (both faces, in two-face mode).
         combined_errors = list(self.errors)
         if second_face_pp is not None:

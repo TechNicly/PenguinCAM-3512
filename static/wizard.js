@@ -478,6 +478,49 @@
     gotoStep(name);
   }
 
+  /* ------------------------------------------------- machine & safety */
+  // Optional soft limits + pause-park behavior (Setup step, collapsed by default).
+  // Prefilled from the team config; blank fields skip validation for that axis.
+  function bindMachineSafety() {
+    var park = CFG.park;   // [x, y, z] machine coords, or null
+    var info = $('#park-info');
+    if (info) {
+      info.textContent = park ?
+        ('Configured park (machine coords): X' + park[0] + ' Y' + park[1] + ' Z' + park[2] +
+         ' - verify against your machine-coordinate DRO.') :
+        'No park position configured - programs stay in work coordinates (no G53).';
+    }
+    var wrap = $('#park-pause-wrap');
+    if (wrap) wrap.hidden = !park;
+    var cb = $('#f-park-pause');
+    if (cb) cb.checked = CFG.parkDuringPause !== false;
+    var lim = CFG.softLimits || {};
+    ['x', 'y', 'z'].forEach(function (axis) {
+      var pair = lim[axis];
+      if (!pair) return;
+      var lo = $('#f-lim-' + axis + 'min'), hi = $('#f-lim-' + axis + 'max');
+      if (lo) lo.value = pair[0];
+      if (hi) hi.value = pair[1];
+    });
+  }
+
+  // The job-level machine_safety payload, read from the panel at submit time.
+  // Only axes with BOTH bounds filled are sent; an empty object means "config
+  // defaults" server-side.
+  function collectMachineSafety() {
+    var out = {};
+    var limits = {};
+    ['x', 'y', 'z'].forEach(function (axis) {
+      var lo = parseFloat(($('#f-lim-' + axis + 'min') || {}).value);
+      var hi = parseFloat(($('#f-lim-' + axis + 'max') || {}).value);
+      if (isFinite(lo) && isFinite(hi)) limits[axis] = [lo, hi];
+    });
+    if (Object.keys(limits).length) out.soft_limits = limits;
+    var cb = $('#f-park-pause');
+    if (cb && CFG.park) out.park_during_pause = cb.checked;
+    return out;
+  }
+
   /* --------------------------------------------------------------- setup */
   function bindSetup() {
     var machineSel = $('#f-machine');
@@ -1494,6 +1537,7 @@
       material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
       stock: { width: bb.w, height: bb.h },
+      machine_safety: collectMachineSafety(),
       name: jobFilename(), parts: [],
     };
     state.parts.forEach(function (p, i) {
@@ -1774,6 +1818,7 @@
     // (multi-layer) export instead of a flat one when the user picked 2.5D.
     window.PenguinCAM.getMode = function () { return state.mode; };
     bindSetup();
+    bindMachineSafety();
     bindParts();
     bindLayout();
     bindTabs();

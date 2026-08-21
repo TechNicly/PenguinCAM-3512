@@ -338,3 +338,16 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
   z-index: 9999;
 }
 #debug-overlay pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; }
+
+/* Machine & safety panel (Setup step) */
+#machine-safety summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+#machine-safety[open] summary { color: var(--ink); margin-bottom: 6px; }
+.limits-grid {
+  display: grid;
+  grid-template-columns: 18px 1fr 1fr;
+  gap: 6px 8px;
+  align-items: center;
+  max-width: 320px;
+  margin-top: 8px;
+}
+.limits-grid input { width: 100%; min-width: 0; }

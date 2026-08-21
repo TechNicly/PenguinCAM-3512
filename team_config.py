@@ -141,7 +141,12 @@ TEAM_6238_DEFAULTS = {
             # holes/pockets and pocket clearing begin - so screws can go in through
             # the fresh holes before any through-cut starts releasing material.
             # When enabled, it replaces the per-contour fixturing pauses.
-            'pause_after_holes': False
+            'pause_after_holes': False,
+            # Whether mid-job fixturing pauses drive to the G53 park_position (when
+            # one is configured). Set false to have pauses raise to safe Z and stop
+            # in place instead - no machine-coordinate motion during the job. The
+            # end-of-program park is unaffected.
+            'park_during_pause': True
         },
         'holes': {
             'detection_tolerance': 0.02,
@@ -476,6 +481,36 @@ class TeamConfig:
         if x is None or y is None or z is None:
             return None
         return (x, y, z)
+
+    @property
+    def soft_limits(self):
+        """Optional machine-coordinate travel limits: {'x': (min, max), ...}, or None.
+
+        These are HOMED machine coordinates in the controller's own convention - on
+        most Mach3/GRBL machines home is 0 and travel is NEGATIVE, e.g.
+        x: [-22.2, 0]. When set, every G53 move the post-processor emits (the park)
+        is validated against them and generation FAILS on a violation instead of
+        emitting a move that would drive through the physical stops. Axes may be
+        given individually; a missing axis is not validated."""
+        raw = self._get('machine', 'soft_limits')
+        if not isinstance(raw, dict):
+            return None
+        limits = {}
+        for axis in ('x', 'y', 'z'):
+            pair = raw.get(axis)
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            lo = parse_length(pair[0])
+            hi = parse_length(pair[1])
+            if lo is None or hi is None:
+                continue
+            limits[axis] = (min(lo, hi), max(lo, hi))
+        return limits or None
+
+    @property
+    def park_during_pause(self) -> bool:
+        """Whether mid-job fixturing pauses drive to the G53 park position."""
+        return bool(self._get('machining', 'fixturing', 'park_during_pause'))
 
     @property
     def safe_clearance_height(self):
