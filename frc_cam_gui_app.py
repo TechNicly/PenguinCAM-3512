@@ -990,6 +990,113 @@ def process_file():
         return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
 
 
+def _parse_tab_overrides(part_spec):
+    """Sanitize a part's `tabs` override block from the wizard's Tabs & Fixtures step.
+
+    Expected shape: {'enabled': bool|null, 'exclusions': [[[ax,ay],[bx,by]], ...],
+    'positions': [[x,y], ...] | null} - all coordinates in job space. Malformed
+    entries are dropped rather than failing the whole job.
+    Returns (enabled, exclusions, positions) as set_tab_overrides expects.
+    """
+    t = part_spec.get('tabs') or {}
+    enabled = t.get('enabled', None)
+    if enabled is not None:
+        enabled = bool(enabled)
+    exclusions = []
+    for pair in (t.get('exclusions') or []):
+        try:
+            (ax, ay), (bx, by) = pair
+            exclusions.append(((float(ax), float(ay)), (float(bx), float(by))))
+        except (TypeError, ValueError):
+            continue
+    positions = t.get('positions', None)
+    if positions is not None:
+        clean = []
+        for p in positions:
+            try:
+                clean.append((float(p[0]), float(p[1])))
+            except (TypeError, ValueError):
+                continue
+        positions = clean
+    return enabled, exclusions, positions
+
+
+def _parse_fixture_points(part_spec):
+    """Sanitize a part's `fixtures` list ([[x,y], ...] job-space screw locations)."""
+    points = []
+    for p in (part_spec.get('fixtures') or []):
+        try:
+            points.append((float(p[0]), float(p[1])))
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
+def _load_job_parts(parts_spec, saved_paths, team_config, material, machine_id,
+                    tool_diameter, thickness, tab_spacing, user_name):
+    """Load, place, and configure each part of a job (shared by /process-job and
+    /job-tab-preview so the tab layout previewed is exactly the one that gets cut).
+
+    Returns (prepared, placed, gen_errors) where prepared items carry the ready
+    FRCPostProcessor plus placement metadata and parsed fixture points."""
+    prepared = []
+    placed = []
+    gen_errors = []
+    for i, part in enumerate(parts_spec):
+        fidx = part.get('file_index', i)
+        if fidx not in saved_paths:
+            gen_errors.append({'part_index': i, 'name': part.get('name'),
+                               'error': f"Missing DXF upload for part {i + 1}"})
+            continue
+        name = part.get('name') or Path(saved_paths[fidx]).stem
+        place_x = float(part.get('place_x', 0.0))
+        place_y = float(part.get('place_y', 0.0))
+        rotation = float(part.get('rotation', 0))
+        mirror = bool(part.get('mirror'))
+
+        pp = FRCPostProcessor(material_thickness=thickness, tool_diameter=tool_diameter,
+                              units='inch', config=team_config)
+        pp.apply_material_preset(material, machine_id)
+        if user_name:
+            pp.user_name = user_name
+        pp.tab_spacing = tab_spacing
+        pp.load_dxf(saved_paths[fidx])
+        pp.transform_coordinates('bottom-left', rotation,
+                                 placement_offset=(place_x, place_y),
+                                 enforce_bounds=False, mirror=mirror)
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+
+        enabled, exclusions, positions = _parse_tab_overrides(part)
+        pp.set_tab_overrides(enabled=enabled, exclusions=exclusions, positions=positions)
+
+        bbox = pp.bounding_box()
+        placed.append({'name': name, 'bbox': bbox, 'polygon': pp.placed_polygon()})
+        prepared.append({'pp': pp, 'bbox': bbox, 'name': name,
+                         'place_x': place_x, 'place_y': place_y, 'rotation': rotation,
+                         'fixtures': _parse_fixture_points(part)})
+    return prepared, placed, gen_errors
+
+
+def _save_job_files(job_dir):
+    """Save the request's file_N uploads into job_dir; returns ({idx: path}, error)."""
+    saved_paths = {}
+    for key in list(request.files.keys()):
+        if not key.startswith('file_'):
+            continue
+        f = request.files[key]
+        if not f.filename.lower().endswith('.dxf'):
+            return None, f'{f.filename} is not a DXF file'
+        try:
+            idx = int(key.split('_', 1)[1])
+        except (ValueError, IndexError):
+            continue
+        p = os.path.join(job_dir, f'part_{idx}.dxf')
+        f.save(p)
+        saved_paths[idx] = p
+    return saved_paths, None
+
+
 @app.route('/process-job', methods=['POST'])
 @limiter.limit("10 per minute")  # CPU intensive
 def process_job():
@@ -1038,20 +1145,9 @@ def process_job():
 
         # Save each uploaded DXF to a distinct path so parts don't clobber each other.
         job_dir = tempfile.mkdtemp(prefix='job_', dir=UPLOAD_FOLDER)
-        saved_paths = {}
-        for key in list(request.files.keys()):
-            if not key.startswith('file_'):
-                continue
-            f = request.files[key]
-            if not f.filename.lower().endswith('.dxf'):
-                return jsonify({'error': f'{f.filename} is not a DXF file'}), 400
-            try:
-                idx = int(key.split('_', 1)[1])
-            except (ValueError, IndexError):
-                continue
-            p = os.path.join(job_dir, f'part_{idx}.dxf')
-            f.save(p)
-            saved_paths[idx] = p
+        saved_paths, file_err = _save_job_files(job_dir)
+        if file_err:
+            return jsonify({'error': file_err}), 400
 
         team_config = TeamConfig.from_dict(_team_config_data())
         user_name = session.get('user_name')
@@ -1061,37 +1157,9 @@ def process_job():
         log(f"[JOB] {len(parts_spec)} parts, tool {tool_diameter}, material {material}, thickness {thickness}")
 
         # Pass 1: build + place each part; collect footprints for layout validation.
-        prepared = []
-        placed = []
-        gen_errors = []
-        for i, part in enumerate(parts_spec):
-            fidx = part.get('file_index', i)
-            if fidx not in saved_paths:
-                gen_errors.append({'part_index': i, 'name': part.get('name'),
-                                   'error': f"Missing DXF upload for part {i + 1}"})
-                continue
-            name = part.get('name') or Path(saved_paths[fidx]).stem
-            place_x = float(part.get('place_x', 0.0))
-            place_y = float(part.get('place_y', 0.0))
-            rotation = float(part.get('rotation', 0))
-            mirror = bool(part.get('mirror'))
-
-            pp = FRCPostProcessor(material_thickness=thickness, tool_diameter=tool_diameter,
-                                  units='inch', config=team_config)
-            pp.apply_material_preset(material, machine_id)
-            if user_name:
-                pp.user_name = user_name
-            pp.tab_spacing = tab_spacing
-            pp.load_dxf(saved_paths[fidx])
-            pp.transform_coordinates('bottom-left', rotation,
-                                     placement_offset=(place_x, place_y),
-                                     enforce_bounds=False, mirror=mirror)
-            pp.identify_perimeter_and_pockets()
-            pp.classify_holes()
-            bbox = pp.bounding_box()
-            placed.append({'name': name, 'bbox': bbox, 'polygon': pp.placed_polygon()})
-            prepared.append({'pp': pp, 'bbox': bbox, 'name': name,
-                             'place_x': place_x, 'place_y': place_y, 'rotation': rotation})
+        prepared, placed, gen_errors = _load_job_parts(
+            parts_spec, saved_paths, team_config, material, machine_id,
+            tool_diameter, thickness, tab_spacing, user_name)
 
         if gen_errors:
             return jsonify({'success': False, 'part_errors': gen_errors}), 400
@@ -1114,12 +1182,15 @@ def process_job():
         # Pass 2: generate each part's toolpath body, then stitch into one program.
         part_jobs = []
         response_parts = []
+        job_warnings = []
         for i, item in enumerate(prepared):
             phases = item['pp'].generate_part_phases()
             if phases['errors']:
                 for e in phases['errors']:
                     gen_errors.append({'part_index': i, 'name': item['name'], 'error': e})
                 continue
+            for w in item['pp'].tab_warnings:
+                job_warnings.append(f"{item['name']}: {w}")
             part_jobs.append({
                 'name': item['name'], 'place_x': item['place_x'],
                 'place_y': item['place_y'], 'rotation': item['rotation'],
@@ -1139,9 +1210,18 @@ def process_job():
         if not part_jobs:
             return jsonify({'error': 'No parts could be generated'}), 400
 
+        # Fixture-screw locations marked in the wizard become operator hints in the
+        # fixturing pause blocks (comment lines only - no motion).
+        fixture_notes = []
+        for item in prepared:
+            safe_name = str(item['name']).replace('(', '[').replace(')', ']')
+            for fx, fy in item['fixtures'][:12]:
+                fixture_notes.append(f"Screw: {safe_name} at X{fx:.2f} Y{fy:.2f}")
+
         result = assemble_job_gcode(part_jobs, header_pp=prepared[0]['pp'],
                                     timestamp=timestamp_str or None,
-                                    suggested_filename=job.get('name', 'job'))
+                                    suggested_filename=job.get('name', 'job'),
+                                    fixture_notes=fixture_notes)
 
         output_path = os.path.join(OUTPUT_FOLDER, result.filename)
         with open(output_path, 'w') as fh:
@@ -1164,7 +1244,72 @@ def process_job():
             'cycle_time_seconds': result.stats.get('cycle_time_seconds'),
             'stock': {'width': round(stock_w, 4), 'height': round(stock_h, 4)},
             'parts': response_parts,
+            'warnings': job_warnings,
         })
+
+    except ValueError as e:
+        return jsonify({'error': f'Invalid parameter value: {str(e)}'}), 400
+    except Exception as e:
+        log(traceback.format_exc())
+        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+    finally:
+        if job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+@app.route('/job-tab-preview', methods=['POST'])
+@limiter.limit("30 per minute")
+def job_tab_preview():
+    """Compute each part's perimeter tab layout for the wizard's Tabs & Fixtures step.
+
+    Takes the same multipart payload as /process-job (job JSON + file_N uploads,
+    including any per-part tab overrides) but stops after part preparation: no G-code
+    is generated. The layout returned is computed by the exact code that will place
+    the tabs at generation time, so what the canvas shows is what gets cut.
+
+    Response: {success, parts: [{index, name, layout: {enabled, contour, ramp, tabs,
+               excluded, warnings}}]} - layout is null for a part with no perimeter.
+    """
+    job_dir = None
+    try:
+        job_raw = request.form.get('job')
+        if not job_raw:
+            return jsonify({'error': 'Missing job specification'}), 400
+        try:
+            job = json.loads(job_raw)
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Invalid job JSON'}), 400
+        parts_spec = job.get('parts', [])
+        if not parts_spec:
+            return jsonify({'error': 'Job has no parts'}), 400
+
+        material = job.get('material', 'plywood')
+        if str(material).lower() == 'polycarb':
+            material = 'polycarbonate'
+        elif str(material).lower() == 'aluminum_tube':
+            material = 'aluminum'
+        tool_diameter = float(job.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
+        thickness = float(job.get('thickness', 0.25))
+        tab_spacing = float(job.get('tab_spacing', 6.0))
+        machine_id = job.get('machine_id')
+
+        job_dir = tempfile.mkdtemp(prefix='tabprev_', dir=UPLOAD_FOLDER)
+        saved_paths, file_err = _save_job_files(job_dir)
+        if file_err:
+            return jsonify({'error': file_err}), 400
+
+        team_config = TeamConfig.from_dict(_team_config_data())
+        prepared, _placed, gen_errors = _load_job_parts(
+            parts_spec, saved_paths, team_config, material, machine_id,
+            tool_diameter, thickness, tab_spacing, user_name=None)
+        if gen_errors:
+            return jsonify({'success': False, 'part_errors': gen_errors}), 400
+
+        parts_out = []
+        for i, item in enumerate(prepared):
+            layout = item['pp'].compute_perimeter_tab_layout()
+            parts_out.append({'index': i, 'name': item['name'], 'layout': layout})
+        return jsonify({'success': True, 'parts': parts_out})
 
     except ValueError as e:
         return jsonify({'error': f'Invalid parameter value: {str(e)}'}), 400

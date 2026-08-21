@@ -31,7 +31,8 @@
                 <li data-step="setup" data-num="1" class="active" role="button" tabindex="0">Setup</li>
                 <li data-step="parts" data-num="2" role="button" tabindex="0">Parts</li>
                 <li data-step="layout" data-num="3" role="button" tabindex="0">Layout</li>
-                <li data-step="preview" data-num="4" role="button" tabindex="0">Preview</li>
+                <li data-step="tabs" data-num="4" role="button" tabindex="0">Tabs</li>
+                <li data-step="preview" data-num="5" role="button" tabindex="0">Preview</li>
             </ol>
         </header>
 
@@ -137,6 +138,23 @@
                 </div>
                 <canvas id="layout-canvas" width="600" height="400"></canvas>
                 <div id="layout-errors" class="errors" aria-live="polite"></div>
+            </section>
+
+            <!-- ===== TABS & FIXTURES ===== -->
+            <section class="step" data-step="tabs" hidden>
+                <h2>Tabs &amp; Fixtures</h2>
+                <p class="hint" id="tabs-hint">Green squares are holding tabs, exactly where they will be cut. Click a part to select it. In Edit mode: click a tab to remove it, click the outline to add one. In Exclude mode: click two points on the outline to keep tabs out of the shorter stretch between them. In Screws mode: click holes to mark fixture screws (listed in the pause message). The dashed orange span is the lead-in ramp.</p>
+                <div id="tabs-toolbar">
+                    <button type="button" class="btn small mode-btn active" id="tabmode-edit">Edit tabs</button>
+                    <button type="button" class="btn small mode-btn" id="tabmode-exclude">Exclude region</button>
+                    <button type="button" class="btn small mode-btn" id="tabmode-fixture">Screws</button>
+                    <span class="spacer"></span>
+                    <label class="hint" id="tabs-enabled-wrap"><input type="checkbox" id="tabs-enabled" checked> Tabs on this part</label>
+                    <button type="button" class="btn small" id="btn-tabs-reset" disabled>Reset part to auto</button>
+                </div>
+                <canvas id="tabs-canvas" width="600" height="400"></canvas>
+                <div id="tabs-status" class="hint" aria-live="polite"></div>
+                <div id="tabs-errors" class="errors" aria-live="polite"></div>
             </section>
 
             <!-- ===== PREVIEW ===== -->

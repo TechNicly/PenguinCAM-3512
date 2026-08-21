@@ -190,9 +190,11 @@ fieldset.field { border: 1px solid var(--line); border-radius: 6px; padding: 8px
   margin-bottom: 8px;
 }
 #layout-info strong { color: var(--ink); }
-#layout-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-#layout-toolbar .spacer { flex: 1; }
-#layout-canvas, #preview-canvas {
+#layout-toolbar, #tabs-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+#layout-toolbar .spacer, #tabs-toolbar .spacer { flex: 1; }
+#tabs-toolbar .mode-btn.active { border-color: var(--accent); color: var(--accent); }
+#tabs-enabled-wrap { display: flex; align-items: center; gap: 5px; margin: 0; }
+#layout-canvas, #tabs-canvas, #preview-canvas {
   width: 100%;
   height: auto;
   background: var(--panel);

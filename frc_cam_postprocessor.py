@@ -20,7 +20,7 @@ from typing import List, Tuple, Optional, Dict, Any
 # Third-party
 import ezdxf
 from shapely import affinity
-from shapely.geometry import Point, Polygon, LinearRing, MultiPolygon
+from shapely.geometry import Point, Polygon, LinearRing, LineString, MultiPolygon
 from shapely.geometry.polygon import orient
 from shapely.ops import unary_union
 
@@ -176,6 +176,13 @@ class FRCPostProcessor:
         # Fixturing preferences from config
         self.pause_before_perimeter = config.pause_before_perimeter  # Pause before perimeter for screw fixturing
         self.pause_after_holes = config.pause_after_holes  # Pause after circular holes, before contours/pockets
+
+        # Per-part perimeter tab overrides (from the wizard's Tabs & Fixtures step;
+        # see set_tab_overrides). Defaults reproduce config-driven auto placement.
+        self.tab_override_enabled = None   # None = follow config; True/False forces it
+        self.tab_exclusions = []           # [((ax,ay),(bx,by)), ...] job-space point pairs
+        self.tab_positions = None          # None = auto; [(x,y), ...] = custom tab centers
+        self.tab_warnings = []             # human-readable tab placement warnings
 
         # Tube facing parameters
         self.tube_facing_offset = 0.0625  # Hole offset to align with faced surface at Y=+1/16" (inches)
@@ -3706,6 +3713,238 @@ class FRCPostProcessor:
 
         return gcode
 
+    def set_tab_overrides(self, enabled=None, exclusions=None, positions=None):
+        """Per-part perimeter tab overrides from the wizard's Tabs & Fixtures step.
+
+        Args:
+            enabled: True/False to force perimeter tabs on/off for this part,
+                None to follow the team config. Pocket-contour tabs are unaffected.
+            exclusions: list of ((ax, ay), (bx, by)) point pairs in job space. Each
+                pair excludes the SHORTER arc of the perimeter between the two points'
+                projections from automatic tab placement.
+            positions: list of (x, y) job-space points. When not None, automatic
+                placement is replaced entirely: one tab is centered at each point's
+                projection onto the tool-compensated perimeter. An empty list means
+                zero tabs (a warning is recorded).
+        """
+        self.tab_override_enabled = enabled
+        self.tab_exclusions = [((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
+                               for a, b in (exclusions or [])]
+        self.tab_positions = None if positions is None else \
+            [(float(p[0]), float(p[1])) for p in positions]
+
+    def _perimeter_tabs_enabled(self) -> bool:
+        """Effective tabs-on state for the part perimeter (override beats config)."""
+        if self.tab_override_enabled is not None:
+            return bool(self.tab_override_enabled)
+        return self.tabs_enabled
+
+    @staticmethod
+    def _subtract_intervals(base, cuts):
+        """Subtract `cuts` from `base`; both are lists of (start, end) with start<end.
+        Returns the remaining intervals, sorted."""
+        result = list(base)
+        for cs, ce in cuts:
+            next_result = []
+            for s, e in result:
+                if ce <= s or cs >= e:
+                    next_result.append((s, e))
+                    continue
+                if cs > s:
+                    next_result.append((s, cs))
+                if ce < e:
+                    next_result.append((ce, e))
+            result = next_result
+        return sorted(result)
+
+    def _compute_tab_zones(self, offset_points, contour_length, ramp_distance,
+                           apply_overrides):
+        """Compute perimeter tab zones as (start_dist, end_dist) along the offset
+        contour, honoring the part's overrides when apply_overrides is True.
+
+        With no overrides this reproduces the historical layout exactly: tabs evenly
+        spaced through the post-ramp cutting length, minimum 3.
+
+        Returns (zones, comments, meta):
+            zones: list of (start, end) distances. A zone lying in the pre-ramp region
+                [0, ramp_distance) is also emitted shifted by +contour_length so the
+                wrapped closing portion of the cut (whose distances run past
+                contour_length) can match it.
+            comments: G-code comment lines describing the layout.
+            meta: {'count': tab count, 'excluded': [(s, e), ...] exclusion intervals}
+        """
+        comments = []
+        half = self.tab_width / 2
+        L = contour_length
+        ring = LineString(list(offset_points) + [offset_points[0]])
+
+        custom = None
+        excluded = []
+        if apply_overrides:
+            if self.tab_positions is not None:
+                custom = sorted(ring.project(Point(p)) for p in self.tab_positions)
+            for a, b in self.tab_exclusions:
+                da, db = ring.project(Point(a)), ring.project(Point(b))
+                lo, hi = sorted((da, db))
+                if (hi - lo) <= (L - (hi - lo)):
+                    excluded.append((lo, hi))          # arc not crossing the start
+                else:
+                    excluded.append((hi, L))           # shorter arc wraps the start
+                    excluded.append((0.0, lo))
+
+        zones = []
+        if custom is not None:
+            for center in custom:
+                s, e = center - half, center + half
+                if s < 0:
+                    zones.append((s + L, L))
+                    zones.append((0.0, e))
+                elif e > L:
+                    zones.append((s, L))
+                    zones.append((0.0, e - L))
+                else:
+                    zones.append((s, e))
+            count = len(custom)
+            comments.append(f"(Tabs: {count} custom positions - width: {self.tab_width:.4f}\")")
+            if any(s < ramp_distance for s, e in zones):
+                comments.append("(Note: a tab near the lead-in may be thinned by the entry ramp)")
+        elif not excluded:
+            # Historical auto layout, byte-identical to the pre-override behavior.
+            cutting_length = L - ramp_distance
+            num_tabs = max(3, int(math.ceil(cutting_length / self.tab_spacing)))
+            actual_tab_spacing = cutting_length / num_tabs
+            for i in range(num_tabs):
+                center = ramp_distance + actual_tab_spacing * (i + 0.5)
+                zones.append((center - half, center + half))
+            count = num_tabs
+            comments.append(f"(Tabs: {num_tabs} tabs - desired spacing: {self.tab_spacing:.2f}\", actual: {actual_tab_spacing:.2f}\" - width: {self.tab_width:.4f}\")")
+        else:
+            # Auto layout constrained to the allowed (non-excluded, post-ramp) arcs.
+            allowed = self._subtract_intervals([(ramp_distance, L)], excluded)
+            allowed = [(s, e) for s, e in allowed if (e - s) >= self.tab_width]
+            total = sum(e - s for s, e in allowed)
+            count = 0
+            if total > 0:
+                num_tabs = max(3, int(math.ceil(total / self.tab_spacing)))
+                # Largest-remainder split of num_tabs across the allowed arcs, capped
+                # by how many tabs physically fit in each.
+                quotas = [(num_tabs * (e - s) / total, i) for i, (s, e) in enumerate(allowed)]
+                counts = [int(q) for q, _ in quotas]
+                for _, i in sorted(quotas, key=lambda t: -(t[0] - int(t[0]))):
+                    if sum(counts) >= num_tabs:
+                        break
+                    counts[i] += 1
+                for (s, e), n in zip(allowed, counts):
+                    n = min(n, int((e - s) / self.tab_width))
+                    for k in range(n):
+                        center = s + (e - s) * (k + 0.5) / max(n, 1)
+                        zones.append((center - half, center + half))
+                    count += n
+            comments.append(f"(Tabs: {count} tabs across {len(allowed)} allowed regions - "
+                            f"{len(excluded)} excluded regions - width: {self.tab_width:.4f}\")")
+
+        # Custom zones in the pre-ramp region are only reachable via the wrapped
+        # closing portion of the cut, whose running distance exceeds contour_length.
+        # (Auto zones always start at or after the ramp, so this never fires there -
+        # keeping default output identical to the pre-override behavior.)
+        if custom is not None:
+            zones.extend((s + L, e + L) for s, e in list(zones) if s < ramp_distance)
+
+        if apply_overrides and self._perimeter_tabs_enabled() and count < 3:
+            msg = (f"Only {count} perimeter tab(s) on this part - it may come loose "
+                   f"before the cut finishes. Add tabs or fixture the part securely.")
+            comments.append(f"(WARNING: {count} tabs only - part may release early)")
+            self.tab_warnings.append(msg)
+
+        return zones, comments, {'count': count, 'excluded': excluded}
+
+    def _point_at_contour_distance(self, offset_points, segment_lengths, distance):
+        """XY at a running distance along the closed offset contour."""
+        total = sum(segment_lengths)
+        d = distance % total if total > 0 else 0.0
+        for i, seg_len in enumerate(segment_lengths):
+            if d <= seg_len or i == len(segment_lengths) - 1:
+                p1 = offset_points[i]
+                p2 = offset_points[(i + 1) % len(offset_points)]
+                t = (d / seg_len) if seg_len > 0 else 0.0
+                return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+            d -= seg_len
+        return offset_points[0]
+
+    def compute_perimeter_tab_layout(self):
+        """The perimeter tab layout this part would be cut with, without generating
+        G-code. Single source of truth for the wizard's Tabs & Fixtures step: the same
+        zone computation used by _generate_contour_gcode, mapped to job-space XY.
+
+        Returns None when the part has no perimeter, else a dict:
+            {'enabled': bool,
+             'contour': [[x, y], ...],           # tool-compensated perimeter (cut path)
+             'ramp': [[x, y], ...],              # lead-in span along the contour
+             'tabs': [{'x','y','start':[x,y],'end':[x,y]}, ...],
+             'excluded': [[[x, y], ...], ...],   # excluded spans, sampled for display
+             'warnings': [...]}
+        """
+        if not getattr(self, 'perimeter', None):
+            return None
+        self.tab_warnings = []
+
+        contour_poly = Polygon(self.perimeter)
+        offset_poly = contour_poly.buffer(self.tool_radius)
+        if offset_poly.is_empty or not hasattr(offset_poly, 'exterior'):
+            return None
+        offset_poly = orient(offset_poly, 1.0)
+        offset_points = list(offset_poly.exterior.coords)[:-1]
+        offset_points = offset_points[::-1]   # perimeter cuts clockwise (climb)
+
+        segment_lengths = [self._distance_2d(offset_points[i],
+                                             offset_points[(i + 1) % len(offset_points)])
+                           for i in range(len(offset_points))]
+        contour_length = sum(segment_lengths)
+
+        ramp_start_height = self.material_top + self.ramp_start_clearance
+        ramp_distance = (ramp_start_height - self.cut_depth) / math.tan(math.radians(self.ramp_angle))
+
+        enabled = self._perimeter_tabs_enabled()
+        tabs = []
+        excluded_spans = []
+        if enabled:
+            zones, _comments, meta = self._compute_tab_zones(
+                offset_points, contour_length, ramp_distance, apply_overrides=True)
+            seen = set()
+            for s, e in zones:
+                if s >= contour_length:
+                    continue   # wrapped duplicate for cut matching; same physical spot
+                key = round(s, 4)
+                if key in seen:
+                    continue
+                seen.add(key)
+                mid = self._point_at_contour_distance(offset_points, segment_lengths, (s + e) / 2)
+                tabs.append({
+                    'x': mid[0], 'y': mid[1],
+                    'start': list(self._point_at_contour_distance(offset_points, segment_lengths, max(s, 0.0))),
+                    'end': list(self._point_at_contour_distance(offset_points, segment_lengths, min(e, contour_length))),
+                })
+            for s, e in meta['excluded']:
+                span = []
+                steps = max(2, int((e - s) / 0.1))
+                for k in range(steps + 1):
+                    span.append(list(self._point_at_contour_distance(
+                        offset_points, segment_lengths, s + (e - s) * k / steps)))
+                excluded_spans.append(span)
+
+        ramp_span = []
+        steps = max(2, int(min(ramp_distance, contour_length) / 0.1))
+        for k in range(steps + 1):
+            ramp_span.append(list(self._point_at_contour_distance(
+                offset_points, segment_lengths, min(ramp_distance, contour_length) * k / steps)))
+
+        return {'enabled': enabled,
+                'contour': [list(p) for p in offset_points],
+                'ramp': ramp_span,
+                'tabs': tabs,
+                'excluded': excluded_spans,
+                'warnings': list(self.tab_warnings)}
+
     def _generate_contour_gcode(self,
                                contour_points: List[Tuple[float, float]],
                                contour_type: str,
@@ -3810,26 +4049,18 @@ class FRCPostProcessor:
             ramp_distance = ramp_depth / math.tan(math.radians(self.ramp_angle))
             gcode.append(f"(Ramp-in: {ramp_distance:.4f}\" at {self.ramp_angle} deg)")
 
-            # Calculate tab zones ONLY on final pass (if tabs are enabled)
+            # Calculate tab zones ONLY on final pass (if tabs are enabled). The part
+            # perimeter honors the wizard's per-part overrides (exclusion regions,
+            # custom positions, forced on/off); pocket contours stay config-driven.
+            is_part_perimeter = (contour_type == 'perimeter')
+            tabs_on = self._perimeter_tabs_enabled() if is_part_perimeter else self.tabs_enabled
             tab_zones = []  # List of (start_dist, end_dist) tuples
-            if is_final_pass and self.tabs_enabled:
-                # We cut from ramp_distance to contour_length, so tabs should only be in that range
-                cutting_length = contour_length - ramp_distance
-
-                # Calculate number of tabs based on desired spacing, with minimum of 3
-                num_tabs = max(3, int(math.ceil(cutting_length / self.tab_spacing)))
-                actual_tab_spacing = cutting_length / num_tabs
-
-                # Place tabs starting after the ramp, centered in each section
-                half_tab_width = self.tab_width / 2
-                for i in range(num_tabs):
-                    tab_center = ramp_distance + actual_tab_spacing * (i + 0.5)
-                    tab_start = tab_center - half_tab_width
-                    tab_end = tab_center + half_tab_width
-                    tab_zones.append((tab_start, tab_end))
-
-                gcode.append(f"(Tabs: {num_tabs} tabs - desired spacing: {self.tab_spacing:.2f}\", actual: {actual_tab_spacing:.2f}\" - width: {self.tab_width:.4f}\")")
-            elif is_final_pass and not self.tabs_enabled:
+            if is_final_pass and tabs_on:
+                tab_zones, tab_comments, _meta = self._compute_tab_zones(
+                    offset_points, contour_length, ramp_distance,
+                    apply_overrides=is_part_perimeter)
+                gcode.extend(tab_comments)
+            elif is_final_pass:
                 gcode.append(f"(Tabs disabled - perimeter will be cut through completely)")
 
             # Move to start
@@ -5514,7 +5745,8 @@ def validate_job_layout(parts, machine_x_max, machine_y_max, min_gap=0.0):
     return errors
 
 
-def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None):
+def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=None,
+                       fixture_notes=None):
     """Stitch per-part G-code phases into one multi-part program, collated by phase.
 
     Rather than running each part to completion before the next, the whole job is
@@ -5535,12 +5767,17 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
             single header/footer, the shared pause, and estimate total cycle time.
             (v1: one tool/material per job.)
         timestamp, suggested_filename: as in generate_gcode.
+        fixture_notes: optional list of operator-hint strings (screw locations marked
+            in the wizard) appended to the fixturing pause instructions. Comment
+            text only - sanitized ASCII, no parentheses.
 
     Returns:
         PostProcessorResult with the assembled program and aggregate stats.
     """
     if not timestamp:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fixture_notes = [str(n).replace('(', '[').replace(')', ']')
+                     for n in (fixture_notes or [])][:24]
 
     gcode = header_pp._generate_gcode_header(timestamp, is_job=True, job_part_count=len(part_jobs))
 
@@ -5572,6 +5809,7 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     # first, then one shared fixturing pause (screws through the fresh holes), then all
     # parts' contours/pockets. With the option off, 'holes' is empty on every part and
     # the whole interior runs as one phase, exactly as before.
+    fixture_notes_emitted = False
     emitted_holes = _emit_phase("PHASE: HOLES", 'holes')
     has_more_interior = any(pj.get('interior') for pj in part_jobs)
     if header_pp.pause_after_holes and emitted_holes and has_more_interior:
@@ -5581,8 +5819,9 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
                 "All parts' circular holes complete",
                 'Install screws through holes into sacrifice board on ALL parts',
                 'Fixture every part securely before contour cutting begins'
-            ]
+            ] + fixture_notes
         ))
+        fixture_notes_emitted = bool(fixture_notes)
 
     # Phase A: all parts' interior features (contours + pockets when the holes phase
     # was split out, the whole interior otherwise).
@@ -5598,8 +5837,18 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
                 "All parts' internal features complete",
                 'Install screws through holes into sacrifice board on ALL parts',
                 'Fixture every part securely before perimeter cutting'
-            ]
+            ] + fixture_notes
         ))
+        fixture_notes_emitted = fixture_notes_emitted or bool(fixture_notes)
+
+    # Screw locations were marked in the wizard but no fixturing pause is configured:
+    # still record them as comments before the perimeters so the operator sheet isn't
+    # silently lost.
+    if fixture_notes and not fixture_notes_emitted and has_perimeters:
+        gcode.append('')
+        gcode.append('(Fixture screw locations, marked in the wizard:)')
+        for note in fixture_notes:
+            gcode.append(f'( {note} )')
 
     # Phase C: all parts' perimeters (tab removal deferred to phase D).
     _emit_phase("PHASE: PERIMETERS", 'perimeter')
